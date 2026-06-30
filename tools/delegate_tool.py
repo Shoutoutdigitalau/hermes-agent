@@ -3431,13 +3431,13 @@ DELEGATE_TASK_SCHEMA = {
             "background": {
                 "type": "boolean",
                 "description": (
-                    "DEPRECATED / IGNORED. Single-task delegations always run "
-                    "in the background automatically — you do not need to (and "
-                    "cannot) opt in or out. The result re-enters the "
-                    "conversation as a new message when the subagent finishes; "
-                    "just continue working in the meantime. Setting this has no "
-                    "effect; the parameter remains only for backward "
-                    "compatibility."
+                    "Optional. Default true for top-level delegations: run in "
+                    "the background and deliver the result back later. Set false "
+                    "ONLY when the user explicitly asks to watch live child-agent "
+                    "progress in the Desktop Subagents panel; false keeps the "
+                    "delegation synchronous, blocks the parent turn, and preserves "
+                    "the native subagent.* event stream. Subagent/orchestrator "
+                    "children always run synchronous regardless."
                 ),
             },
             "acp_command": {
@@ -3475,17 +3475,20 @@ from tools.registry import registry, tool_error
 def _model_background_value(args: dict, parent_agent=None) -> bool:
     """Background flag for the MODEL-facing dispatch path (registry fallback).
 
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
-    batch (each task becomes its own independent background subagent). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
-    ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
+    Delegations from the top-level agent default to background mode. Explicit
+    ``background=false`` is honored for visible/Desktop Subagents-panel runs.
+    Delegations from orchestrator subagents (depth > 0) stay synchronous because
+    they need worker results within their own turn. The live path is
+    ``run_agent._dispatch_delegate_task``; this helper mirrors it for the rare
     case the intercept is bypassed. Direct Python callers of ``delegate_task``
     keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    if is_subagent:
+        return False
+    if args.get("background") is not None:
+        return is_truthy_value(args.get("background"), default=True)
+    return True
 
 
 registry.register(

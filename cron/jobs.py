@@ -730,7 +730,12 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     raw = str(workdir).strip()
     if not raw:
         return None
-    expanded = Path(raw).expanduser()
+    if raw == "~" or raw.startswith("~/") or raw.startswith("~\\"):
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        suffix = raw[2:] if len(raw) > 1 else ""
+        expanded = Path(home) / suffix if suffix else Path(home)
+    else:
+        expanded = Path(raw).expanduser()
     if not expanded.is_absolute():
         raise ValueError(
             f"Cron workdir must be an absolute path (got {raw!r}). "

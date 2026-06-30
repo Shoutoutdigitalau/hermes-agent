@@ -5344,18 +5344,20 @@ class AIAgent:
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import delegate_task as _delegate_task
-        # Delegations from the top-level MODEL always run in the background —
-        # the model does not get to choose. delegate_task returns immediately
-        # with a handle (one per task) and each subagent's result re-enters the
-        # conversation as a new message when it finishes. This applies to BOTH
-        # a single task and a fan-out batch (each task becomes its own
-        # independent background subagent). The one exception:
-        #   - A delegation from an ORCHESTRATOR SUBAGENT (depth > 0) stays
-        #     synchronous: the orchestrator needs its workers' results within
-        #     its own turn to compose a summary, and a subagent doesn't own the
-        #     gateway session the async result would route back to.
-        # The schema-level `background` param is intentionally ignored here.
+        # Top-level model delegations default to background mode: delegate_task
+        # returns a handle immediately and the result re-enters the conversation
+        # as a new message when it finishes. Two exceptions stay synchronous:
+        #   - An ORCHESTRATOR SUBAGENT (depth > 0), because it needs worker
+        #     results inside its own turn and does not own the gateway session
+        #     the async result would route back to.
+        #   - An explicit model/tool request of background=false, used when the
+        #     user asks to watch live child-agent progress in the Desktop
+        #     Subagents panel. This blocks the parent turn, but preserves the
+        #     native subagent.* event stream that the panel renders.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        _background = not _is_subagent
+        if (not _is_subagent) and function_args.get("background") is not None:
+            _background = is_truthy_value(function_args.get("background"), default=True)
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
@@ -5365,7 +5367,7 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=_background,
             parent_agent=self,
         )
 
