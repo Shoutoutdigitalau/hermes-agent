@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from tools.skill_manager_tool import (
+    SKILL_MANAGE_SCHEMA,
     _validate_name,
     _validate_category,
     _validate_frontmatter,
@@ -53,6 +54,18 @@ description: Updated description.
 
 Step 1: Do the new thing.
 """
+
+
+class TestSkillManageSchema:
+    def test_skill_lifecycle_requires_curator_or_explicit_user_request(self):
+        description = SKILL_MANAGE_SCHEMA["description"]
+
+        assert "explicit user-requested skill change" in description
+        assert "curator workflow" in description
+        assert "do not create, patch, or save skills" in description
+        assert "complex task succeeded" not in description
+        assert "patch it immediately" not in description
+        assert "offer to save as a skill" not in description
 
 
 # ---------------------------------------------------------------------------
