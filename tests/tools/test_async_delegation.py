@@ -624,10 +624,11 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert _drain_one() is None
 
 
-def test_model_dispatch_honors_visible_background_false():
-    """The MODEL-facing dispatch path defaults top-level work to background,
-    honors explicit background=false for visible Desktop panel runs, and keeps
-    orchestrator subagent work synchronous."""
+def test_model_dispatch_forces_background():
+    """The MODEL-facing dispatch path forces background=True for any top-level
+    delegation (single task OR batch), and keeps it off for an orchestrator
+    subagent (depth > 0). Direct delegate_task() callers are unaffected (they
+    keep the synchronous default)."""
     import tools.delegate_tool as dt
     from unittest.mock import MagicMock
 
@@ -636,26 +637,23 @@ def test_model_dispatch_honors_visible_background_false():
     sub = MagicMock()
     sub._delegate_depth = 1
 
-    # Registry-fallback helper: top-level defaults to background, but explicit
-    # background=false opts into synchronous/visible Subagents-panel execution;
-    # subagents never background.
+    # Registry-fallback helper: top-level always background, regardless of
+    # single vs batch; subagent never.
     assert dt._model_background_value({"goal": "x"}, top) is True
     assert dt._model_background_value(
         {"tasks": [{"goal": "a"}, {"goal": "b"}]}, top
     ) is True
     assert dt._model_background_value({"tasks": [{"goal": "a"}]}, top) is True
-    assert dt._model_background_value({"goal": "x", "background": False}, top) is False
-    assert dt._model_background_value({"goal": "x", "background": True}, top) is True
     assert dt._model_background_value({"goal": "x"}, sub) is False
     assert dt._model_background_value(
         {"tasks": [{"goal": "a"}, {"goal": "b"}]}, sub
     ) is False
 
 
-def test_run_agent_dispatch_honors_explicit_visible_background_false():
-    """run_agent._dispatch_delegate_task defaults top-level work to background,
-    but honors explicit background=false for visible Subagents-panel runs and
-    keeps subagent delegations synchronous."""
+def test_run_agent_dispatch_forces_background():
+    """run_agent._dispatch_delegate_task — the live model path — forces
+    background on for any top-level delegation (single OR batch) and off for a
+    subagent."""
     from unittest.mock import patch
     import run_agent
 
@@ -676,12 +674,6 @@ def test_run_agent_dispatch_honors_explicit_visible_background_false():
         run_agent.AIAgent._dispatch_delegate_task(
             agent, {"tasks": [{"goal": "a"}, {"goal": "b"}]}
         )
-        assert captured["background"] is True
-
-        run_agent.AIAgent._dispatch_delegate_task(agent, {"goal": "x", "background": False})
-        assert captured["background"] is False
-
-        run_agent.AIAgent._dispatch_delegate_task(agent, {"goal": "x", "background": True})
         assert captured["background"] is True
 
         sub = _FakeAgent()
