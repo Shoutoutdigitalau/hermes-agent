@@ -67,6 +67,16 @@ def _stable_prompt(agent):
         return build_system_prompt_parts(agent)["stable"]
 
 
+def test_combined_skill_and_memory_guidance_defers_skill_lifecycle():
+    stable = _stable_prompt(_make_agent(valid_tool_names=["memory", "skill_manage"]))
+
+    assert "directly relevant or materially useful" in stable
+    assert "curator workflow or an explicit user request owns skill lifecycle changes" in stable
+    assert "save it as a skill" not in stable
+    assert "skill_manage(action='patch')" not in stable
+    assert "offer to save as a skill" not in stable
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""
