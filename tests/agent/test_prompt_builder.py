@@ -415,6 +415,25 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
+    def test_skill_guidance_uses_outcome_first_judgment(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "directly relevant or materially useful" in result
+        assert "do not load one merely because it is partially relevant" in result
+        assert "curator workflow or an explicit user request" in result
+        assert "## Skills (mandatory)" not in result
+        assert "If a skill matches or is even partially relevant" not in result
+        assert "MUST load it" not in result
+        assert "skill_manage(action='patch')" not in result
+        assert "offer to save as a skill" not in result
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
