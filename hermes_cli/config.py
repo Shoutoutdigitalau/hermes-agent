@@ -2413,6 +2413,14 @@ DEFAULT_CONFIG = {
                                      # (floor 30s) to enforce a hard cap.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
+        # Optional operator-controlled model/reasoning allowlist exposed to the
+        # existing delegate_task tool as a `worker` enum. Worker profiles share
+        # delegation.provider credentials; arbitrary per-call models remain blocked.
+        # Example:
+        # workers:
+        #   terra: {model: gpt-5.6-terra, reasoning_effort: high, description: "Bounded work"}
+        #   luna: {model: gpt-5.6-luna, reasoning_effort: xhigh, description: "Complex work"}
+        "workers": {},
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
                                        # delegation units. New async dispatches beyond the cap

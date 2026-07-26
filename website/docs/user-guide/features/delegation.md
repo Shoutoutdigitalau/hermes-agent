@@ -153,6 +153,26 @@ delegation:
 
 If omitted, subagents use the same model as the parent.
 
+### Named worker profiles
+
+When different task classes need different models or reasoning depth, configure an operator-controlled worker allowlist:
+
+```yaml
+delegation:
+  provider: openai-codex
+  workers:
+    terra:
+      model: gpt-5.6-terra
+      reasoning_effort: high
+      description: Standard bounded work
+    luna:
+      model: gpt-5.6-luna
+      reasoning_effort: xhigh
+      description: Complex, ambiguous, or high-risk work
+```
+
+The `delegate_task` schema then exposes `worker` as an enum containing only `terra` and `luna`, including each optional `description` as routing guidance. A single task can set `worker: terra`; a mixed batch can select a different worker per task. The profile overrides the child model and reasoning level while reusing the global delegation provider and credentials. If `worker` is omitted, Hermes uses the existing global delegation route. Unknown names fail before any child starts.
+
 ## Inherited Tool Access
 
 `delegate_task` does not accept a model-facing `toolsets` parameter. Each subagent inherits the parent's enabled toolsets so the model cannot grant a child capabilities that the parent does not have. Configure the parent's tools before starting the conversation if delegated work needs additional capabilities.
@@ -295,6 +315,9 @@ delegation:
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider
   api_mode: anthropic_messages                       # optional; auto-detected from base_url for anthropic_messages endpoints
+  # workers:                                         # Optional model/reasoning allowlist
+  #   fast: {model: "openai/gpt-4o-mini", reasoning_effort: "low"}
+  #   deep: {model: "openai/gpt-5", reasoning_effort: "xhigh"}
 
 # Or use a direct custom endpoint instead of provider:
 delegation:

@@ -137,6 +137,39 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
         self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
 
+    def test_schema_exposes_only_operator_configured_worker_profiles(self):
+        """The model may select a named worker profile, never an arbitrary model."""
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        cfg = {
+            "max_concurrent_children": 5,
+            "max_spawn_depth": 1,
+            "orchestrator_enabled": True,
+            "workers": {
+                "terra": {
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "high",
+                    "description": "Standard bounded work",
+                },
+                "luna": {
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "xhigh",
+                    "description": "Complex or high-risk work",
+                },
+                "broken": {"reasoning_effort": "high"},
+            },
+        }
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            overrides = _build_dynamic_schema_overrides()
+
+        props = overrides["parameters"]["properties"]
+        self.assertEqual(props["worker"]["enum"], ["luna", "terra"])
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertEqual(task_props["worker"]["enum"], ["luna", "terra"])
+        self.assertIn("operator-configured", props["worker"]["description"])
+        self.assertIn("luna: Complex or high-risk work", props["worker"]["description"])
+
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
@@ -319,6 +352,92 @@ class TestDelegateTask(unittest.TestCase):
         parent = _make_mock_parent()
         result = json.loads(delegate_task(tasks=[{"context": "no goal here"}], parent_agent=parent))
         self.assertIn("error", result)
+
+    def test_unknown_worker_profile_is_rejected_before_child_construction(self):
+        parent = _make_mock_parent()
+        cfg = {
+            "max_concurrent_children": 5,
+            "max_spawn_depth": 1,
+            "workers": {
+                "terra": {
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "high",
+                }
+            },
+        }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            result = json.loads(
+                delegate_task(
+                    goal="Investigate the issue",
+                    worker="luna",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("error", result)
+        self.assertIn("Unknown delegation worker 'luna'", result["error"])
+        mock_agent.assert_not_called()
+
+    def test_batch_worker_profiles_override_model_and_reasoning(self):
+        parent = _make_mock_parent()
+        parent.provider = "openai-codex"
+        parent.model = "gpt-5.6-sol"
+        parent.api_mode = "codex_responses"
+        parent.base_url = "https://chatgpt.com/backend-api/codex"
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+        cfg = {
+            "provider": "",
+            "model": "",
+            "max_iterations": 50,
+            "max_concurrent_children": 5,
+            "max_spawn_depth": 1,
+            "orchestrator_enabled": True,
+            "workers": {
+                "terra": {
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "high",
+                },
+                "luna": {
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "xhigh",
+                },
+            },
+        }
+        children = [MagicMock(), MagicMock()]
+        for child in children:
+            child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("run_agent.AIAgent", side_effect=children) as mock_agent,
+        ):
+            result = json.loads(
+                delegate_task(
+                    tasks=[
+                        {"goal": "Bounded implementation", "worker": "terra"},
+                        {"goal": "High-risk architecture review", "worker": "luna"},
+                    ],
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual([entry["status"] for entry in result["results"]], ["completed", "completed"])
+        terra_kwargs = mock_agent.call_args_list[0].kwargs
+        luna_kwargs = mock_agent.call_args_list[1].kwargs
+        self.assertEqual(terra_kwargs["model"], "gpt-5.6-terra")
+        self.assertEqual(terra_kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
+        self.assertEqual(luna_kwargs["model"], "gpt-5.6-luna")
+        self.assertEqual(luna_kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
 
     @patch("tools.delegate_tool._run_single_child")
     def test_single_task_mode(self, mock_run):

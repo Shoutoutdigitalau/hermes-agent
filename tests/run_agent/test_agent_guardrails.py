@@ -208,6 +208,32 @@ class TestCapDelegateTaskCalls:
             assert actual is exp, f"mismatch at index {i}"
 
 
+class TestDelegateTaskDispatch:
+    def test_worker_profile_reaches_delegate_tool(self, monkeypatch):
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "ok"
+
+        monkeypatch.setattr("tools.delegate_tool.delegate_task", fake_delegate_task)
+        agent = object.__new__(AIAgent)
+        agent._delegate_depth = 0
+
+        result = agent._dispatch_delegate_task(
+            {
+                "goal": "Inspect the system",
+                "worker": "luna",
+                "role": "leaf",
+            }
+        )
+
+        assert result == "ok"
+        assert captured["worker"] == "luna"
+        assert captured["background"] is True
+        assert captured["parent_agent"] is agent
+
+
 # ---------------------------------------------------------------------------
 # Phase 2b — _deduplicate_tool_calls
 # ---------------------------------------------------------------------------

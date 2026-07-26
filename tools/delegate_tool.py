@@ -17,6 +17,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import json
 import logging
@@ -349,6 +350,66 @@ def _normalize_role(r: Optional[str]) -> str:
         return r_norm
     logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
     return "leaf"
+
+
+def _configured_worker_profiles(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    """Return valid operator-configured delegation worker profiles.
+
+    Worker profiles deliberately share the global delegation provider and
+    credentials. They may select only a model and reasoning level, keeping the
+    model-facing ``worker`` argument inside an operator-approved allowlist.
+    """
+    source = cfg if isinstance(cfg, dict) else _load_config()
+    raw_workers = source.get("workers") or {}
+    if not isinstance(raw_workers, dict):
+        return {}
+
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for raw_name, raw_profile in raw_workers.items():
+        name = str(raw_name or "").strip().lower()
+        if not name or not isinstance(raw_profile, dict):
+            continue
+        model = str(raw_profile.get("model") or "").strip()
+        if not model:
+            continue
+
+        reasoning_config = None
+        raw_effort = raw_profile.get("reasoning_effort")
+        if raw_effort or raw_effort is False:
+            from hermes_constants import parse_reasoning_effort
+
+            reasoning_config = parse_reasoning_effort(raw_effort)
+            if reasoning_config is None:
+                logger.warning(
+                    "Ignoring delegation worker %r: invalid reasoning_effort=%r",
+                    name,
+                    raw_effort,
+                )
+                continue
+
+        profiles[name] = {
+            "name": name,
+            "model": model,
+            "reasoning_config": reasoning_config,
+            "description": str(raw_profile.get("description") or "").strip(),
+        }
+    return profiles
+
+
+def _resolve_worker_profile(
+    worker: Optional[str], cfg: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """Resolve a model-facing worker name against the operator allowlist."""
+    if worker is None or not str(worker).strip():
+        return None
+    name = str(worker).strip().lower()
+    profiles = _configured_worker_profiles(cfg)
+    if name not in profiles:
+        allowed = ", ".join(sorted(profiles)) or "none configured"
+        raise ValueError(
+            f"Unknown delegation worker '{name}'. Available worker profiles: {allowed}."
+        )
+    return profiles[name]
 
 
 def _get_max_concurrent_children() -> int:
@@ -1086,6 +1147,10 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Resolved from delegation.workers before child construction. The model may
+    # select only a named profile; it cannot supply arbitrary values here.
+    reasoning_config_override: Optional[Dict[str, Any]] = None,
+    worker_name: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1317,6 +1382,9 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    if reasoning_config_override is not None:
+        child_reasoning = dict(reasoning_config_override)
+
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
@@ -1414,6 +1482,7 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    child._delegate_worker = worker_name
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -2435,6 +2504,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    worker: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2538,7 +2608,14 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {
+                "goal": goal,
+                "context": context,
+                "role": top_role,
+                "worker": worker,
+            }
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2553,6 +2630,16 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Resolve every requested worker before creating transcripts or child
+    # sessions, so a typo fails atomically and no partial fan-out starts.
+    worker_profiles = []
+    for task in task_list:
+        requested_worker = task.get("worker") or worker
+        try:
+            worker_profiles.append(_resolve_worker_profile(requested_worker, cfg))
+        except ValueError as exc:
+            return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -2604,6 +2691,7 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            worker_profile = worker_profiles[i]
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2611,7 +2699,7 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=(worker_profile or {}).get("model") or creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
@@ -2624,6 +2712,8 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                reasoning_config_override=(worker_profile or {}).get("reasoning_config"),
+                worker_name=(worker_profile or {}).get("name"),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -3475,7 +3565,9 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Arbitrary subagent models are NOT selectable per call. Children inherit "
+        "the global delegation route unless the operator configured named "
+        "delegation.workers profiles; the model may select only those allowlisted names.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3539,15 +3631,35 @@ def _build_dynamic_schema_overrides() -> dict:
     get_definitions() pass rewrites the description fields to the user's
     actual limits.
     """
-    overrides_params = {
-        **DELEGATE_TASK_SCHEMA["parameters"],
-    }
-    # Deep-copy properties so we don't mutate the static schema dict.
-    overrides_params["properties"] = {
-        k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
-    }
+    overrides_params = copy.deepcopy(DELEGATE_TASK_SCHEMA["parameters"])
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+
+    worker_profiles = _configured_worker_profiles()
+    worker_names = sorted(worker_profiles)
+    if worker_names:
+        profile_details = []
+        for name in worker_names:
+            profile = worker_profiles[name]
+            reasoning = profile.get("reasoning_config") or {}
+            effort = reasoning.get("effort") if reasoning.get("enabled") else "none"
+            detail = profile.get("description") or (
+                f"model={profile['model']}, reasoning_effort={effort or 'inherit'}"
+            )
+            profile_details.append(f"{name}: {detail}")
+        worker_description = (
+            "Select an operator-configured child model/reasoning profile. "
+            "Configured profiles: " + "; ".join(profile_details) + "."
+        )
+        worker_property = overrides_params["properties"]["worker"]
+        worker_property["enum"] = worker_names
+        worker_property["description"] = worker_description
+        task_worker = overrides_params["properties"]["tasks"]["items"]["properties"]["worker"]
+        task_worker["enum"] = worker_names
+        task_worker["description"] = "Per-task worker profile override. " + worker_description
+    else:
+        overrides_params["properties"].pop("worker", None)
+        overrides_params["properties"]["tasks"]["items"]["properties"].pop("worker", None)
 
     return {
         "description": _build_top_level_description(),
@@ -3604,6 +3716,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "worker": {
+                            "type": "string",
+                            "description": "(rebuilt at get_definitions() time)",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3615,6 +3731,10 @@ DELEGATE_TASK_SCHEMA = {
             "role": {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
+                "description": "(rebuilt at get_definitions() time)",
+            },
+            "worker": {
+                "type": "string",
                 "description": "(rebuilt at get_definitions() time)",
             },
             "background": {
@@ -3688,6 +3808,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        worker=args.get("worker"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
