@@ -2641,6 +2641,24 @@ def delegate_task(
         except ValueError as exc:
             return tool_error(str(exc))
 
+    # Preserve the resolved operator-controlled route in the dispatch manifest.
+    # Recording only the caller's worker label is not enough: the configured
+    # model or reasoning effort can change, and proof must reflect what this
+    # dispatch actually resolved before child construction.
+    manifest_task_list = []
+    for task, worker_profile in zip(task_list, worker_profiles):
+        manifest_task = dict(task)
+        if worker_profile:
+            reasoning = worker_profile.get("reasoning_config") or {}
+            manifest_task["_resolved_worker_route"] = {
+                "worker": worker_profile.get("name"),
+                "model": worker_profile.get("model"),
+                "reasoning_effort": (
+                    reasoning.get("effort") if isinstance(reasoning, dict) else None
+                ),
+            }
+        manifest_task_list.append(manifest_task)
+
     overall_start = time.monotonic()
     results = []
 
@@ -2660,7 +2678,7 @@ def delegate_task(
     )
 
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context
+        manifest_task_list, context
     )
 
     # Save parent tool names BEFORE any child construction mutates the global.

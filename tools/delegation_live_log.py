@@ -353,24 +353,34 @@ def _manifest_path(delegation_id: str) -> Path:
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str]) -> None:
     try:
+        manifest_tasks = []
+        for i, task in enumerate(task_list):
+            entry = {
+                "index": i,
+                # manifest.json sits in the same mounted
+                # cache/delegation/live/<id>/ directory as the .log files,
+                # so it needs the same treatment — redacting the header
+                # while serialising the goal verbatim here would leave the
+                # credential exposed one file over.
+                "goal": _redact(str(task.get("goal", ""))[:500]),
+                "log": paths[i] if i < len(paths) else None,
+                "status": "running",
+            }
+            route = task.get("_resolved_worker_route")
+            if isinstance(route, dict):
+                safe_route = {
+                    key: _redact(str(route[key]))
+                    for key in ("worker", "model", "reasoning_effort")
+                    if route.get(key) is not None
+                }
+                if safe_route:
+                    entry["route"] = safe_route
+            manifest_tasks.append(entry)
         manifest = {
             "delegation_id": delegation_id,
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "task_count": len(task_list),
-            "tasks": [
-                {
-                    "index": i,
-                    # manifest.json sits in the same mounted
-                    # cache/delegation/live/<id>/ directory as the .log files,
-                    # so it needs the same treatment — redacting the header
-                    # while serialising the goal verbatim here would leave the
-                    # credential exposed one file over.
-                    "goal": _redact(str(t.get("goal", ""))[:500]),
-                    "log": paths[i] if i < len(paths) else None,
-                    "status": "running",
-                }
-                for i, t in enumerate(task_list)
-            ],
+            "tasks": manifest_tasks,
         }
         _manifest_path(delegation_id).write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"

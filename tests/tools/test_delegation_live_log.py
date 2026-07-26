@@ -420,6 +420,58 @@ def test_batch_dispatch_creates_one_log_per_task(monkeypatch):
         assert goal in Path(p).read_text(encoding="utf-8")
 
 
+def test_batch_manifest_records_resolved_worker_routes(monkeypatch):
+    import tools.delegate_tool as dt
+
+    parent = _make_parent()
+    profiles = {
+        "terra": {
+            "name": "terra",
+            "model": "gpt-5.6-terra",
+            "reasoning_config": {"enabled": True, "effort": "high"},
+        },
+        "luna": {
+            "name": "luna",
+            "model": "gpt-5.6-luna",
+            "reasoning_config": {"enabled": True, "effort": "xhigh"},
+        },
+    }
+
+    def make_child(**kw):
+        child = MagicMock()
+        child._delegate_role = "leaf"
+        child.tool_progress_callback = None
+        return child
+
+    monkeypatch.setattr(dt, "_build_child_agent", make_child)
+    monkeypatch.setattr(dt, "_run_single_child", _fake_run)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: _CREDS)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_worker_profile",
+        lambda name, cfg=None: profiles[name] if name else None,
+    )
+
+    out = json.loads(dt.delegate_task(
+        tasks=[{"goal": "alpha"}, {"goal": "beta", "worker": "luna"}],
+        worker="terra",
+        parent_agent=parent,
+    ))
+    manifest = json.loads(
+        (Path(out["live_transcripts"][0]).parent / "manifest.json").read_text()
+    )
+    assert manifest["tasks"][0]["route"] == {
+        "worker": "terra",
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "high",
+    }
+    assert manifest["tasks"][1]["route"] == {
+        "worker": "luna",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "xhigh",
+    }
+
+
 def test_child_progress_events_land_in_live_log(monkeypatch):
     """Events fired through the child's (wrapped) tool_progress_callback land
     in the transcript file in order — the seam the real agent loop drives."""
