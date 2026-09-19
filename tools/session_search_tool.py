@@ -55,6 +55,91 @@ _COMPACTION_PREFIXES = ("[CONTEXT COMPACTION", "[CONTEXT SUMMARY]:")
 _FRESH_RESET_END_REASONS = _BOUNDARY_END_REASONS
 
 
+def _team_authz_module():
+    """team_authz when present, else None (ungoverned base behaviour)."""
+    try:
+        from agent import team_authz as _tz
+        return _tz
+    except Exception:
+        return None
+
+
+def _session_row_for_authz(meta: Dict[str, Any], profile: Optional[str] = None) -> Dict[str, Any]:
+    """SessionDB row mapped to can_read_session input (source→platform)."""
+    row = {
+        "platform": (meta.get("source") or "") if meta else "",
+        "user_id": (meta.get("user_id") or "") if meta else "",
+        "chat_id": (meta.get("chat_id") or "") if meta else "",
+        "thread_id": (meta.get("thread_id") or "") if meta else "",
+    }
+    if profile:
+        row["profile"] = profile
+    return row
+
+
+def _r2_shared_dest_denied(meta: Dict[str, Any], ctx, principal, _tz=None) -> bool:
+    """r2 private-destination restriction: non-owners in a shared destination may only
+    read the current shared conversation. Runs BEFORE can_read_session's own shortcut so
+    own-private history is never injected into a wider group. Listed oversight
+    destinations stay with can_read_session (oversight, audited)."""
+    if ctx is None or principal is None or getattr(principal, "denied", False):
+        return False
+    if getattr(principal, "is_owner", False):
+        return False
+    if not getattr(ctx, "chat_id", None):
+        return True
+    if (getattr(ctx, "chat_type", "dm") or "dm").lower() == "dm":
+        return False
+    row_chat = (meta.get("chat_id") or "") if meta else ""
+    row_thread = (meta.get("thread_id") or "") if meta else ""
+    ctx_thread = getattr(ctx, "thread_id", None) or None
+    if row_chat and row_chat == ctx.chat_id and (row_thread or None) == ctx_thread:
+        return False
+    if _tz is not None:
+        try:
+            import json as _json
+            reg_path = _tz.register_path()
+            with open(reg_path, encoding="utf-8") as _f:
+                _reg = _json.load(_f)
+            _dests = {str(d.get("chatId") or "") for d in (_reg.get("oversight", {}) or {}).get("destinations", [])}
+            if str(getattr(ctx, "chat_id", "") or "") in _dests:
+                return False
+        except Exception:
+            pass
+    return True
+
+
+def _can_read_session_meta(db, meta_or_id, profile: Optional[str] = None) -> bool:
+    """One ownership predicate for every search mode. Ungoverned → True; governed →
+    r2 destination restriction then can_read_session (which audits oversight reads
+    before output). Any governed error denies."""
+    _tz = _team_authz_module()
+    if _tz is None:
+        return True
+    try:
+        governed = _tz.is_governed()
+    except Exception:
+        return False
+    if not governed:
+        return True
+    try:
+        meta = _get_session_meta(db, meta_or_id) if isinstance(meta_or_id, str) else (meta_or_id or {})
+        if not meta:
+            return False
+        ctx = _tz.current_requester()
+        try:
+            principal = _tz.resolve_principal(ctx)
+        except Exception:
+            return False
+        if _r2_shared_dest_denied(meta, ctx, principal, _tz):
+            return False
+        dest = {"chatId": ctx.chat_id} if ctx is not None and getattr(ctx, "chat_id", None) else {}
+        row = _session_row_for_authz(meta, profile)
+        return bool(_tz.can_read_session(row, destination=dest, ctx=ctx).allowed)
+    except Exception:
+        return False
+
+
 def _quiet(fn, default, msg, *log_args, with_exc: bool = False):
     """``fn()``, or *default* after debug-logging *msg* (+ the exception when *with_exc*)."""
     try:
@@ -106,16 +191,21 @@ def _is_compaction_summary(content: str) -> bool:
 def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
     """Walk parent_session_id to the root -> ``(root_id, has_compression_hop)``; the flag
     separates a compression-split lineage (parent summarised away) from a delegation
-    lineage (child still visible to the parent)."""
+    lineage (child still visible to the parent). Denied ancestors read as absent."""
+    if session_id and not _can_read_session_meta(db, session_id):
+        return session_id, False
     visited: set[str] = set()
     cur, has_compression = session_id, False
     while cur and cur not in visited:
         visited.add(cur)
         s = _get_session_meta(db, cur)
         has_compression = has_compression or s.get("end_reason") == "compression"
-        if not s.get("parent_session_id"):
+        parent = s.get("parent_session_id")
+        if not parent:
             break
-        cur = s["parent_session_id"]
+        if not _can_read_session_meta(db, parent):
+            break
+        cur = parent
     return cur, has_compression
 
 
@@ -207,18 +297,27 @@ def _session_left_live_context(db, session_id: str) -> bool:
     (summarised into the child) or a fresh reset (child starts empty). Live delegation
     children (``end_reason is None``) and ``branched`` parents (copied verbatim into
     the branch) ARE the current context, so they stay excluded from recall."""
+    if session_id and not _can_read_session_meta(db, session_id):
+        return False
     end_reason = (session_id and _get_session_meta(db, session_id).get("end_reason")) or None
     return end_reason == "compression" or end_reason in _FRESH_RESET_END_REASONS
 
 
 def _get_message_storage_state(db, message_id) -> Optional[Dict[str, Any]]:
-    """Owning session and visibility flags for *message_id* (None if missing/error)."""
+    """Owning session and visibility flags for *message_id* (None if missing/error).
+    Messages in denied sessions read as missing."""
     def _lookup():
         with db._lock:
             return db._conn.execute(
                 "SELECT session_id, active, compacted FROM messages WHERE id = ?", (message_id,)).fetchone()
     row = message_id and _quiet(_lookup, None, "message storage-state lookup failed for %s", message_id)
-    return dict(row) if row else None
+    if not row:
+        return None
+    state = dict(row)
+    owning = state.get("session_id")
+    if owning and not _can_read_session_meta(db, owning):
+        return None
+    return state
 
 
 def _is_compacted_state(state: Optional[Dict[str, Any]]) -> bool:
@@ -272,14 +371,19 @@ def _discovery_entry(lineage_root: Optional[str], **fields) -> Dict[str, Any]:
     return entry
 
 
-def _title_match_result(db, query: str, current_lineage_root: Optional[str]) -> Optional[Dict[str, Any]]:
+def _title_match_result(db, query: str, current_lineage_root: Optional[str],
+                        profile: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Discovery-shaped result when the query matches a session title, else None."""
     title_query = query.strip().strip("`'\"")  # models often quote a remembered title
     session_id = title_query and _quiet(lambda: db.resolve_session_by_title(title_query), None,
                                         "resolve_session_by_title failed for %r", title_query)
     if not session_id:
         return None
+    if not _can_read_session_meta(db, session_id, profile):
+        return None
     lineage_root = _resolve_lineage(db, session_id)
+    if lineage_root and lineage_root != session_id and not _can_read_session_meta(db, lineage_root, profile):
+        return None
     # Same-lineage title hits are in-context only while the session is live;
     # /new-reset and compression-ended parents are not.
     if current_lineage_root and lineage_root == current_lineage_root and not _session_left_live_context(db, session_id):
@@ -326,9 +430,14 @@ def _bookend(view: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
             if not _is_compaction_summary(m.get("content", ""))]
 
 
-def _hydrate_hit(db, lineage_root: str, match_info: Dict[str, Any], result_detail: str) -> Optional[Dict[str, Any]]:
+def _hydrate_hit(db, lineage_root: str, match_info: Dict[str, Any], result_detail: str,
+               profile: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Discovery result from a surviving FTS row; None (dropped) if the view can't load."""
     hit_sid, msg_id = match_info.get("session_id") or lineage_root, match_info.get("id")
+    if not _can_read_session_meta(db, hit_sid, profile):
+        return None
+    if lineage_root and lineage_root != hit_sid and not _can_read_session_meta(db, lineage_root, profile):
+        return None
     try:
         view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
     except Exception as e:
@@ -357,7 +466,7 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
     """Discovery shape: FTS5 plus adaptive or full result hydration."""
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     excluded_roots = _excluded_lineage_roots(db, exclude_session_ids or [])
-    title_result = _title_match_result(db, query, current_lineage_root)
+    title_result = _title_match_result(db, query, current_lineage_root, link_profile)
     # FTS rows are time-bounded in SQL (_search_filter_clauses); the title match bypasses that
     # query, so it is the one place the window is re-checked in Python.
     if title_result:
@@ -393,7 +502,12 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
     for r in raw_results:
         if len(seen_sessions) >= limit:
             break
-        raw_sid, resolved_sid = r["session_id"], _resolve_lineage(db, r["session_id"])
+        raw_sid = r["session_id"]
+        if not _can_read_session_meta(db, raw_sid, link_profile):
+            continue
+        resolved_sid = _resolve_lineage(db, raw_sid)
+        if resolved_sid != raw_sid and not _can_read_session_meta(db, resolved_sid, link_profile):
+            continue
         if raw_sid in excluded_roots or resolved_sid in excluded_roots:
             continue
         # Skip the current session lineage — UNLESS the hit's transcript has left live context. Three
@@ -417,7 +531,7 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
         if match_info.get("_title_only"):
             continue
         # Adaptive: only the top-ranked result is fully hydrated.
-        entry = _hydrate_hit(db, lineage_root, match_info, "full" if detail == "full" or not results else "compact")
+        entry = _hydrate_hit(db, lineage_root, match_info, "full" if detail == "full" or not results else "compact", link_profile)
         if entry is not None:
             results.append(entry)
     for entry in results:
@@ -447,6 +561,8 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     """Read shape: whole session, or ``head`` + ``tail`` messages with a scroll pointer."""
     meta = _get_session_meta(db, session_id)
     if not meta:
+        return tool_error(f"session_id not found: {session_id}", success=False)
+    if not _can_read_session_meta(db, meta, link_profile):
         return tool_error(f"session_id not found: {session_id}", success=False)
     rows, err = _loud(lambda: db.get_messages(session_id), "get_messages failed for %s: %s", "failed to load session",
                       session_id)
@@ -488,19 +604,29 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
         bounded_list = getattr(db, "list_recent_sessions_bounded", None)
         if bounded_list is None:
             raise RuntimeError("session database does not support bounded recent-session browse")
+        _tz = _team_authz_module()
+        governed = bool(_tz is not None and _quiet(lambda: _tz.is_governed(), False, "is_governed failed"))
         sessions = bounded_list(
-            limit=limit + 15,  # extra so we can skip current / compression roots
+            limit=limit + (100 if governed else 15),  # extra so we can skip current / compression roots + denied rows
             exclude_sources=list(_HIDDEN_SESSION_SOURCES), timeout_seconds=3.0)
         current_root, has_compression_hop = (
             _resolve_to_parent(db, current_session_id) if current_session_id else (None, False))
         # Compression continuation: the root was summarised into the live child, so hide
         # it. /new-reset children carry no transcript — keep that root browsable.
         hidden = {current_session_id, current_root if has_compression_hop and current_root else None}
-        results = [{
-            "session_id": s.get("id", ""), "link": _session_link(s.get("id", ""), link_profile),
-            "title": s.get("title") or None, **{k: s.get(k, "") for k in ("source", "started_at", "last_active")},
-            "message_count": s.get("message_count", 0), "preview": s.get("preview", "")}
-            for s in [x for x in sessions if x.get("id", "") not in hidden][:limit]]
+        results = []
+        for s in sessions:
+            sid = s.get("id", "")
+            if sid in hidden:
+                continue
+            if not _can_read_session_meta(db, sid, link_profile):
+                continue
+            results.append({
+                "session_id": sid, "link": _session_link(sid, link_profile),
+                "title": s.get("title") or None, **{k: s.get(k, "") for k in ("source", "started_at", "last_active")},
+                "message_count": s.get("message_count", 0), "preview": s.get("preview", "")})
+            if len(results) >= limit:
+                break
         return _ok(mode="browse", results=results, count=len(results), message=(
             f"Showing {len(results)} most recent sessions. Pass a query= to search, "
             "or session_id+around_message_id to scroll."))
@@ -528,16 +654,20 @@ def _anchor_in_live_context(db, anchor_state, anchor_sid: str, current_session_i
 
 
 def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
-            current_session_id: str = None) -> str:
+            current_session_id: str = None, profile: Optional[str] = None) -> str:
     """Scroll shape: a window centered on an anchor (no FTS5, no bookends)."""
     try:
         around_message_id = int(around_message_id)
     except (TypeError, ValueError):
         return tool_error("scroll requires integer around_message_id", success=False)
     window = _clamp_int(window, 5, 1, 20)
+    if not _can_read_session_meta(db, session_id, profile):
+        return tool_error(f"session_id not found: {session_id}", success=False)
     # Locate the anchor BEFORE the current-lineage guard (see _anchor_in_live_context).
     anchor_state = _get_message_storage_state(db, around_message_id)
     owning = (anchor_state or {}).get("session_id")
+    if owning and owning != session_id and not _can_read_session_meta(db, owning, profile):
+        return tool_error(f"around_message_id {around_message_id} not in session_id {session_id}", success=False)
     if current_session_id and _anchor_in_live_context(db, anchor_state, owning or session_id, current_session_id):
         return tool_error("scroll rejected: anchor lives in the current session lineage (already in your active context)", success=False)
     session_meta = _get_session_meta(db, session_id)
@@ -552,7 +682,7 @@ def _scroll(db, session_id: str, around_message_id: int, window: int = 5,
     if not messages and owning and owning != session_id:
         # Lineage rebind: the caller paired a parent session_id with a message id
         # living in a descendant — serve the owner's window transparently.
-        rebind_view = _same_lineage(db, session_id, owning) and _quiet(
+        rebind_view = (_can_read_session_meta(db, owning, profile) and _same_lineage(db, session_id, owning)) and _quiet(
             lambda: db.get_messages_around(owning, around_message_id, window=window),
             None, "rebind get_messages_around failed: %s", with_exc=True)
         if rebind_view and rebind_view.get("window"):
@@ -586,6 +716,34 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
             session_id = emb_id
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
+    # Explicit profile reads are owner-only. Deny before opening the other store so
+    # non-owners learn nothing about its existence (indistinguishable from absent).
+    _prof = (profile or "").strip() if isinstance(profile, str) else ""
+    if _prof:
+        _tz = _team_authz_module()
+        if _tz is not None:
+            try:
+                _governed = _tz.is_governed()
+            except Exception:
+                _governed = True
+            if _governed:
+                try:
+                    _pr = _tz.resolve_principal()
+                    _is_owner = bool(getattr(_pr, "is_owner", False) and not getattr(_pr, "denied", True))
+                except Exception:
+                    _is_owner = False
+                if not _is_owner:
+                    if isinstance(session_id, str) and session_id.strip():
+                        return tool_error(f"session_id not found: {session_id.strip()}", success=False)
+                    if not query or not isinstance(query, str) or not query.strip():
+                        return _ok(mode="browse", results=[], count=0, message=(
+                            "Showing 0 most recent sessions. Pass a query= to search, "
+                            "or session_id+around_message_id to scroll."))
+                    _det = "full" if isinstance(detail, str) and detail.strip().lower() == "full" else "adaptive"
+                    return _ok(mode="discover", query=query.strip(), detail=_det, results=[], count=0,
+                               message=("No matching sessions found. FTS5 ANDs all terms by default \u2014 "
+                                        "broaden with OR (`alpha OR beta`), exact-match with quoted "
+                                        "phrases, exclude with NOT, or prefix-match with `deploy*`."))
     # Cross-profile: swap in the named profile's DB (read-only) for every shape;
     # current-lineage guards key off ids that won't collide, so they stay inert.
     try:
@@ -597,7 +755,7 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
         owned_dbs.append(profile_db)
     if isinstance(session_id, str) and session_id.strip():
         if around_message_id is not None:
-            return _scroll(db, session_id.strip(), around_message_id, window, current_session_id)
+            return _scroll(db, session_id.strip(), around_message_id, window, current_session_id, profile)
         return _read_scoped(db, session_id.strip(), profile)
     limit = _clamp_int(limit, 3, 1, 10)
     if not query or not isinstance(query, str) or not query.strip():

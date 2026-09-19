@@ -20,6 +20,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
+from agent import team_authz
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
@@ -132,6 +133,97 @@ def _capture_routing_origin() -> Dict[str, Any]:
         return {}
 
 
+# ── Team-authz requester stamps (HTS-04) ─────────────────────────────────────
+# Async records persist identity references only — never grants. Every consumer
+# (worker start, completion, restart replay) re-resolves the ref against the
+# live register; unknown, revoked, stale or ref-less governed work is dropped
+# with an audit row before backend access or delivery. Ungoverned dispatches
+# stamp ``requester_governed=False`` and behave exactly as base.
+_STAMP_KEYS = ("requester_ref", "requester_governed", "requester_digest")
+
+
+def _capture_requester_stamp() -> Dict[str, Any]:
+    """Identity-only stamp for re-resolution at run/completion/replay."""
+    try:
+        if not team_authz.is_governed():
+            return {"requester_ref": {}, "requester_governed": False,
+                    "requester_digest": None}
+        return {"requester_ref": team_authz.requester_ref(),
+                "requester_governed": True,
+                "requester_digest": team_authz.grant_digest()}
+    except Exception:
+        return {"requester_ref": {}, "requester_governed": True,
+                "requester_digest": None}
+
+
+def _ctx_from_ref(ref: Any) -> Optional[team_authz.RequesterContext]:
+    """Rebuild an explicit context from a persisted ref (no ambient mutation)."""
+    if not isinstance(ref, dict) or not ref:
+        return None
+    try:
+        return team_authz.RequesterContext(
+            platform=str(ref.get("platform") or ""),
+            user_id=ref.get("user_id"),
+            scope_id=ref.get("scope_id"),
+            chat_id=ref.get("chat_id"),
+            chat_type=str(ref.get("chat_type") or "dm"),
+            thread_id=ref.get("thread_id"),
+            session_key=ref.get("session_key"),
+        )
+    except Exception:
+        return None
+
+
+def _gate_persisted_requester(*, ref: Any, governed: Any, digest: Any,
+                              event: str) -> Optional[str]:
+    """Re-resolve a persisted stamp. None to proceed, else the deny reason.
+
+    Already audited on deny. Ungoverned-origin work (no marker, including
+    pre-feature rows) always proceeds.
+    """
+    if not governed:
+        return None
+    ctx = _ctx_from_ref(ref)
+    if ctx is None:
+        team_authz.audit({"event": event, "tool": "delegate_task",
+                          "decision": "denied",
+                          "reason": team_authz.DENY_NO_REQUESTER_CONTEXT})
+        return team_authz.DENY_NO_REQUESTER_CONTEXT
+    principal = team_authz.resolve_principal(ctx)
+    if principal.denied:
+        reason = principal.deny_reason or "unknown-identity"
+        team_authz.audit({"event": event, "tool": "delegate_task",
+                          "policyVersion": principal.policy_version,
+                          "memberKey": principal.member_key,
+                          "discordUserId": principal.discord_user_id,
+                          "scope": ctx.scope_id, "decision": "denied",
+                          "reason": reason})
+        return reason
+    if digest is not None and team_authz.grant_digest(ctx) != digest:
+        team_authz.audit({"event": event, "tool": "delegate_task",
+                          "policyVersion": principal.policy_version,
+                          "memberKey": principal.member_key,
+                          "discordUserId": principal.discord_user_id,
+                          "scope": ctx.scope_id, "decision": "denied",
+                          "reason": "requester-stale"})
+        return "requester-stale"
+    return None
+
+
+def _persist_dropped_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Persist a dropped completion: the outcome stays queryable, never delivered."""
+    try:
+        _persist_completion(event, result)
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute("""UPDATE async_delegations SET state='dropped',
+                       delivery_state='dropped', updated_at=?
+                       WHERE delegation_id=?""",
+                         (time.time(), event["delegation_id"]))
+    except Exception:
+        logger.exception("Async delegation %s: failed to persist dropped completion",
+                         event.get("delegation_id"))
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
     try:
@@ -141,7 +233,8 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes",
+                    *_ROUTING_KEYS, *_STAMP_KEYS)
         if key in record}
     with _DB_LOCK, _transaction() as conn:
         conn.execute("""INSERT OR REPLACE INTO async_delegations
@@ -281,11 +374,11 @@ def restore_undelivered_completions(target_queue) -> int:
     recover_abandoned_delegations()
     now, restored = time.time(), 0
     with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
+        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at, task_json
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
-        for delegation_id, payload, completed_at, dispatched_at in rows:
+        for delegation_id, payload, completed_at, dispatched_at, task_json in rows:
             age_basis = completed_at or dispatched_at
             if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
                 conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
@@ -295,6 +388,22 @@ def restore_undelivered_completions(target_queue) -> int:
                 logger.warning("Async delegation %s: pending completion is %.1fh old "
                                "(cap %.1fh); terminally dropping the replay (result remains queryable).",
                                delegation_id, (now - age_basis) / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
+                continue
+            try:
+                task = json.loads(task_json or "{}")
+            except Exception:
+                task = {}
+            drop_reason = _gate_persisted_requester(
+                ref=task.get("requester_ref"), governed=task.get("requester_governed"),
+                digest=task.get("requester_digest"), event="async-replay-drop")
+            if drop_reason is not None:
+                conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+                              delivery_claim=NULL, delivery_claimed_at=NULL,
+                              updated_at=?
+                       WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
+                logger.warning("Async delegation %s: pending completion dropped by team "
+                               "authorization (%s); result remains queryable.",
+                               delegation_id, drop_reason)
                 continue
             evt = json.loads(payload)
             if isinstance(evt, dict):
@@ -560,6 +669,7 @@ def _dispatch_admitted(
         "session_key": session_key, "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id, "parent_session_id": parent_session_id,
         **_capture_routing_origin(),
+        **_capture_requester_stamp(),
         "status": "running", "dispatched_at": dispatched_at, "completed_at": None,
         "interrupt_fn": interrupt_fn, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id,
@@ -589,14 +699,34 @@ def _dispatch_admitted(
             if rec is not None:
                 # The stall clock starts when the runner starts; a unit queued behind a full pool is not stalled.
                 rec.update(_started=True, _progress_ts=time.time())
+                stamp = {k: rec.get(k) for k in _STAMP_KEYS}
+            else:
+                stamp = {}
+        drop_reason = _gate_persisted_requester(
+            ref=stamp.get("requester_ref"), governed=stamp.get("requester_governed"),
+            digest=stamp.get("requester_digest"), event="async-drop")
+        if drop_reason is not None:
+            logger.warning("Async delegation%s %s dropped by team authorization: %s",
+                           label, delegation_id, drop_reason)
+            _finalize_dropped(delegation_id, drop_reason)
+            return
+        token = None
         try:
-            result = runner() or {}
-            status = classify(result)
-        except Exception as exc:  # noqa: BLE001 — must never crash the worker
-            logger.exception(f"Async delegation{label} %s crashed", delegation_id)
-            result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
+            if stamp.get("requester_ref"):
+                # Rebind the persisted identity for the run so children inherit
+                # the requester through the copied context (re-resolved above).
+                token = team_authz.bind_requester(stamp["requester_ref"])
+            try:
+                result = runner() or {}
+                status = classify(result)
+            except Exception as exc:  # noqa: BLE001 — must never crash the worker
+                logger.exception(f"Async delegation{label} %s crashed", delegation_id)
+                result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
+            finally:
+                _finalize(delegation_id, result, status)
         finally:
-            _finalize(delegation_id, result, status)
+            if token is not None:
+                team_authz.reset_requester(token)
 
     from hermes_cli.backend_retirement import retirement
 
@@ -682,6 +812,39 @@ def dispatch_async_delegation_batch(
 
 
 # ── Finalization + completion events ────────────────────────────────────────
+def _finalize_dropped(delegation_id: str, reason: str) -> None:
+    """Terminally drop a unit whose requester no longer resolves (HTS-04).
+
+    The runner never started: persist a ``dropped`` outcome (queryable, never
+    delivered) and retire the in-memory record. The audit row was written by
+    the gate.
+    """
+    now = time.time()
+    with _records_lock:
+        record = _records.get(delegation_id)
+        snapshot = dict(record) if record else {}
+    error = f"Dropped by team authorization ({reason})"
+    event = {
+        "type": "async_delegation", "delegation_id": delegation_id,
+        "session_key": snapshot.get("session_key", ""),
+        "origin_ui_session_id": snapshot.get("origin_ui_session_id", ""),
+        "origin_session_id": snapshot.get("origin_session_id", ""),
+        "parent_session_id": snapshot.get("parent_session_id"),
+        "goal": snapshot.get("goal", ""),
+        **({"goals": snapshot.get("goals")} if snapshot.get("is_batch") else {}),
+        "status": "dropped", "summary": None, "error": error,
+        "dispatched_at": snapshot.get("dispatched_at") or now,
+        "completed_at": now,
+    }
+    result = {"status": "dropped", "summary": None, "error": error}
+    _persist_dropped_completion(event, result)
+    with _records_lock:
+        if delegation_id in _records:
+            _records[delegation_id]["status"] = "dropped"
+            _records[delegation_id]["completed_at"] = now
+        _prune_completed_locked()
+
+
 def _finalize(delegation_id: str, result: Any, status: str) -> None:
     """Atomically claim terminal delivery, push the completion event, then mark ``status``.
     ``result`` is a dict or a callable receiving the record snapshot (stall path). The record
@@ -697,18 +860,46 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         snapshot = dict(record)
-    _push_completion_event(snapshot, result(snapshot) if callable(result) else result, status)
+    dropped = _push_completion_event(snapshot, result(snapshot) if callable(result) else result, status)
     with _records_lock:
         if delegation_id in _records:
-            _records[delegation_id]["status"] = status
+            _records[delegation_id]["status"] = "dropped" if dropped else status
         _prune_completed_locked()
 
 
-def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], status: str) -> None:
+def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], status: str) -> bool:
     """Push a type='async_delegation' event onto the shared completion queue. Batch records
     (``is_batch``) carry the per-task ``results`` list (plus live transcript paths, the
     full-fidelity record of each child's run) instead of a single summary. Best-effort: failure
-    must not crash the worker, but it WOULD mean a silently-lost result, so we log loudly."""
+    must not crash the worker, but it WOULD mean a silently-lost result, so we log loudly.
+
+    Returns True when the completion was dropped by team authorization (HTS-04):
+    the requester is re-resolved at completion time and an unknown, revoked,
+    stale or ref-less governed origin drops the delivery with an audit row
+    instead of enqueueing it. The result stays queryable in the ledger.
+    """
+    drop_reason = _gate_persisted_requester(
+        ref=record.get("requester_ref"), governed=record.get("requester_governed"),
+        digest=record.get("requester_digest"), event="async-completion-drop")
+    if drop_reason is not None:
+        logger.warning("Async delegation %s completion dropped by team authorization: %s",
+                       record.get("delegation_id"), drop_reason)
+        completed_at = record.get("completed_at") or time.time()
+        evt = {
+            "type": "async_delegation", "delegation_id": record.get("delegation_id"),
+            "session_key": record.get("session_key", ""),
+            "origin_ui_session_id": record.get("origin_ui_session_id", ""),
+            "origin_session_id": record.get("origin_session_id", ""),
+            "parent_session_id": record.get("parent_session_id"),
+            "goal": record.get("goal", ""),
+            **({"goals": record.get("goals")} if record.get("is_batch") else {}),
+            "status": "dropped", "summary": None,
+            "error": f"Dropped by team authorization ({drop_reason})",
+            "dispatched_at": record.get("dispatched_at") or completed_at,
+            "completed_at": completed_at,
+        }
+        _persist_dropped_completion(evt, result)
+        return True
     is_batch = bool(record.get("is_batch"))
     label = " batch" if is_batch else ""
     try:
@@ -753,6 +944,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
     except Exception as exc:  # pragma: no cover
         logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
                      "result lost: %s", record.get("delegation_id"), exc)
+    return False
 
 
 def push_task_failure_notice(delegation_id: str, entry: Dict[str, Any], *, n_tasks: int) -> None:

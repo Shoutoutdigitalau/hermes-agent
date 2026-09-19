@@ -2290,6 +2290,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     )
     if not isinstance(function_args, dict):
         function_args = {}
+    from model_tools import team_authz_denied, team_authz_deny_result, team_authz_deny_text
+    _ta_denied = team_authz_denied(function_name, function_args)
+    if _ta_denied is not None:
+        result = json.dumps({"error": team_authz_deny_text(_ta_denied)}, ensure_ascii=False)
+        emit_terminal_post_tool_call(
+            agent, function_name=function_name, function_args=function_args, result=result,
+            effective_task_id=effective_task_id, tool_call_id=tool_call_id, status="blocked",
+            error_type="team_authz_denied", error_message=getattr(_ta_denied, "reason", "denied"),
+            middleware_trace=list(tool_request_middleware_trace or []),
+        )
+        return result
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
@@ -2347,6 +2358,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             import model_tools
             return model_tools.handle_function_call(function_name, next_args, effective_task_id, **dispatch_kwargs)
+    # Recheck the final (middleware-transformed) args at actual execution for
+    # both the inline and registry branches; registry calls re-enter the
+    # handle_function_call guards as well.
+    _ta_raw_execute = _execute
+
+    def _execute(next_args: dict) -> Any:
+        _ta_final = team_authz_denied(
+            function_name, next_args if isinstance(next_args, dict) else function_args)
+        if _ta_final is not None:
+            return team_authz_deny_result(_ta_final)
+        return _ta_raw_execute(next_args)
+
     if skip_tool_execution_middleware:
         return _execute(function_args)
     from hermes_cli.middleware import run_tool_execution_middleware

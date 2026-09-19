@@ -575,6 +575,9 @@ def _looks_like_image(data: bytes) -> bool:
 
 def _write_cache_file(cache_dir: Path, prefix: str, ext: str, data: bytes) -> str:
     """Write ``data`` to ``<cache_dir>/<prefix>_<uuid12><ext>``; return the path string."""
+    from agent.team_authz_perimeter import cache_team_media
+    if team_path := cache_team_media(data, ext):
+        return team_path
     filepath = cache_dir / f"{prefix}_{uuid.uuid4().hex[:12]}{ext}"
     filepath.write_bytes(data)
     return str(filepath)
@@ -1075,6 +1078,9 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     (``HERMES_MEDIA_DELIVERY_STRICT=1``, public bots where prompt injection must not exfiltrate
     host secrets): MUST be under a Hermes cache, an operator root (``HERMES_MEDIA_ALLOW_DIRS``),
     or freshly produced within the recency window. Symlinks are resolved before any check."""
+    from agent.team_authz_perimeter import media_payload_denial
+    if media_payload_denial({"image_url": path}):
+        return None
     candidate = _normalize_media_tag_path(path)
     if not candidate:
         return None
@@ -1122,6 +1128,9 @@ def _validated_delivery_path(raw_path, session_key: str, label: str) -> Optional
     """``validate_media_delivery_path`` plus the shared "Skipping unsafe ..." warning. A path the
     host cannot see is retried against the active remote sandbox (ssh/modal/...; #466)."""
     raw = str(raw_path)
+    from agent.team_authz_perimeter import media_payload_denial
+    if media_payload_denial({"image_url": raw}):
+        return None  # A policy denial is never a remote-fetch fallback.
     safe_path = validate_media_delivery_path(raw, session_key=session_key)
     if not safe_path:
         from gateway.media_fetch import fetch_remote_media
@@ -3376,17 +3385,21 @@ class BasePlatformAdapter(ABC):
         if eph_ttl > 0 and result.success and result.message_id:
             self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
 
+    @contextlib.contextmanager
     def _media_delivery_scope(self, source: Optional[SessionSource]):
         """Routed home + terminal policy for post-handler text, media and error delivery;
-        a no-op without a runner or outside multiplexing."""
+        a no-op without a runner or outside multiplexing. Also restores the trusted
+        requester after the agent turn has unwound (team_authz)."""
+        from agent.team_authz import bind_requester, reset_requester
         resolve = getattr(self.gateway_runner, "_media_delivery_scope_for_source", None)
-        if not callable(resolve) or source is None:
-            return contextlib.nullcontext()
-        try:
-            return resolve(source)
-        except Exception:
-            logger.debug("[%s] Failed to resolve media delivery scope", self.name, exc_info=True)
-            return contextlib.nullcontext()
+        scope = resolve(source) if callable(resolve) and source is not None else contextlib.nullcontext()
+        with scope:
+            token = bind_requester(source) if source is not None else None
+            try:
+                yield
+            finally:
+                if token is not None:
+                    reset_requester(token)
 
     def _final_delivery_adapter(self, source: Optional[SessionSource]) -> "BasePlatformAdapter":
         """The runner's CURRENT adapter for a new final-response send: a reconnect can swap the

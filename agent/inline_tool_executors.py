@@ -94,6 +94,23 @@ def _callback_tool(module: str, func: str, callback_attr: str, *arg_specs: _ArgS
 
 
 def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
+    try:
+        from agent import team_authz as _tz
+    except Exception:
+        _tz = None
+    if _tz is not None:
+        try:
+            governed = _tz.is_governed()
+        except Exception:
+            governed = True
+        if governed:
+            try:
+                principal = _tz.resolve_principal()
+            except Exception:
+                return json.dumps({"success": False, "error": "denied: policy-error"})
+            if getattr(principal, "denied", False):
+                reason = getattr(principal, "deny_reason", "") or "denied"
+                return json.dumps({"success": False, "error": f"denied: {reason}"})
     session_db = agent._get_session_db_for_recall()
     if not session_db:
         from hermes_state import format_session_db_unavailable

@@ -19,13 +19,17 @@ def _eval_ssrf_guard_active(effective_task_id: str) -> bool:
     only matters for non-local backends (cloud browser, or a containerized terminal whose
     browser-on-host reaches networks the terminal can't); skipped for local sidecars / ``allow_private_urls``.
     """
+    from agent.team_authz_perimeter import member_browser_restricted
+    if member_browser_restricted():
+        return True
     _bt = _origin()
     return not _cloud._is_local_backend() and not _bt._is_local_sidecar_key(effective_task_id) and not _cloud._allow_private_urls()
 
 
 def _url_blocked(_bt, url: str) -> bool:
     """True when ``url`` hits the always-blocked cloud-metadata floor or fails the SSRF guard."""
-    return _bt._is_always_blocked_url(url) or not _bt._is_safe_url(url)
+    from agent.team_authz_perimeter import browser_url_denial
+    return bool(browser_url_denial(url)) or _bt._is_always_blocked_url(url) or not _bt._is_safe_url(url)
 
 
 # URL-shaped literals embedded in a JS expression (http/https only). fetch/XHR/navigate
@@ -43,17 +47,19 @@ def _expression_targets_private_url(expression: str) -> Optional[str]:
 
 def _current_page_private_url(effective_task_id: str) -> Optional[str]:
     """Return the current page URL when it targets a private/internal address (e.g. after a prior
-    ``location.href = '...'`` eval). Fail-open on probe failure, matching the snapshot/vision guards."""
+    ``location.href = '...'`` eval). Governed members fail closed on probe failure;
+    owner and ungoverned sessions retain their existing behavior."""
     _bt = _origin()
     try:
         url_result = _session._run_browser_command(effective_task_id, "eval", ["window.location.href"], timeout=5, _engine_override="auto")
         if url_result.get("success"):
             current_url = url_result.get("data", {}).get("result", "").strip().strip('"').strip("'")
-            if current_url and _url_blocked(_bt, current_url):
-                return current_url
+            if current_url:
+                return current_url if _url_blocked(_bt, current_url) else None
     except Exception as exc:
         _bt.logger.debug("_current_page_private_url: probe failed (%s)", exc)
-    return None
+    from agent.team_authz_perimeter import member_browser_restricted
+    return "an unverified page" if member_browser_restricted() else None
 
 
 _RISKY_BROWSER_EVAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -152,16 +158,16 @@ def _enforce_browser_eval_policy(expression: str) -> Optional[str]:
 
 
 def _camofox_current_page_private_url(tab_id: str, user_id: str) -> Optional[str]:
-    """Camofox analogue of ``_current_page_private_url`` (evaluate endpoint instead of the CLI). Fail-open
-    on probe failure, matching the snapshot/vision guards — do not make fail-closed without the sibling."""
+    """Camofox counterpart of the CLI probe; governed members fail closed."""
     _bt = _origin()
     try:
         from tools.browser_camofox import _post
         data = _post(f"/tabs/{tab_id}/evaluate", body={"expression": "window.location.href", "userId": user_id})
         current_url = str(data.get("result") if isinstance(data, dict) else data or "")
         current_url = current_url.strip().strip('"').strip("'")
-        if current_url and _url_blocked(_bt, current_url):
-            return current_url
+        if current_url:
+            return current_url if _url_blocked(_bt, current_url) else None
     except Exception as exc:
         _bt.logger.debug("_camofox_current_page_private_url: probe failed (%s)", exc)
-    return None
+    from agent.team_authz_perimeter import member_browser_restricted
+    return "an unverified page" if member_browser_restricted() else None

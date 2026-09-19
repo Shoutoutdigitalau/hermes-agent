@@ -483,6 +483,9 @@ def _file_to_data_url(path: Path) -> Optional[str]:
     loop shrinks on rejection, so lenient providers pay no silent quality tax);
     MIMEs outside the accepted set are transcoded to PNG. None when unreadable,
     blocked by the read guard, or untranscodable — the caller reports ``skipped``."""
+    from agent.team_authz_perimeter import media_payload_denial
+    if media_payload_denial({"image_path": str(path)}):
+        return None
     try:
         from agent.file_safety import raise_if_read_blocked
 

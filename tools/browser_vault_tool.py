@@ -206,6 +206,22 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _team_authz_vault_denied(tool_name: str, args: dict) -> Optional[str]:
+    """Team-authz recheck at the vault resource boundary (HTS-03).
+
+    Returns a JSON deny result — the vault backend is never enumerated,
+    unlocked or prompted — or None to proceed. Vault tools are
+    credentials-class protected, so governed non-owners deny here even with
+    approvals off or yolo enabled.
+    """
+    from model_tools import team_authz_denied, team_authz_deny_text
+    denied = team_authz_denied(tool_name, args)
+    if denied is None:
+        return None
+    return json.dumps({"success": False, "error_type": "team_authz_denied",
+                       "error": team_authz_deny_text(denied)}, ensure_ascii=False)
+
+
 def browser_vault_list() -> str:
     """List login handles + metadata across every enabled backend. Passwords are never included.
 
@@ -215,6 +231,9 @@ def browser_vault_list() -> str:
     from agent.vault_backends import enabled_backends
     from agent.vault_backends.unlock import can_prompt_here
 
+    _ta_vault = _team_authz_vault_denied("browser_vault_list", {})
+    if _ta_vault is not None:
+        return _ta_vault
     items, locked, errors = [], [], []
     for backend in enabled_backends():
         if backend.needs_unlock and not backend.is_unlocked():
@@ -253,6 +272,9 @@ def browser_vault_unlock(backend_name: str) -> str:
     from agent.vault_backends import enabled_backends
     from agent.vault_backends.unlock import can_prompt_here, get_unlock_prompt_callback
 
+    _ta_vault = _team_authz_vault_denied("browser_vault_unlock", {"backend": backend_name})
+    if _ta_vault is not None:
+        return _ta_vault
     backend = next((b for b in enabled_backends() if b.name == backend_name and b.needs_unlock), None)
     if backend is None:
         return json.dumps({"success": False, "error": f"No unlockable vault backend named {backend_name!r}."})
@@ -286,6 +308,9 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     effective_task_id = task_id or "default"
     # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
     # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
+    _ta_vault = _team_authz_vault_denied("browser_vault_save_login", {"label": label})
+    if _ta_vault is not None:
+        return _ta_vault
     _focus_bound_origin(effective_task_id, "", "login")
     origin = _current_page_origin(effective_task_id)
     if not origin:
@@ -332,6 +357,9 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
+    _ta_vault = _team_authz_vault_denied("browser_vault_enter_code", {"handle": handle})
+    if _ta_vault is not None:
+        return _ta_vault
     _focus_bound_origin(effective_task_id, "", "otp")
     origin = _current_page_origin(effective_task_id)
     if not origin:
@@ -409,6 +437,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
 
     effective_task_id = task_id or "default"
+    _ta_vault = _team_authz_vault_denied("browser_vault_fill", {"handle": handle})
+    if _ta_vault is not None:
+        return _ta_vault
     backend = backend_for_handle(handle)
     if backend is not None and backend.needs_unlock and not backend.is_unlocked():
         unlocked = json.loads(browser_vault_unlock(backend.name))

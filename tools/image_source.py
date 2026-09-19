@@ -55,6 +55,9 @@ async def resolve_image_source(
     if not isinstance(src, str) or not src.strip():
         raise SourceNotFound("image_url is required", src=str(src))
     s = src.strip()
+    from agent.team_authz_perimeter import media_payload_denial
+    if denial := media_payload_denial({"image_url": s}):
+        raise SourceUnsafe(denial, src="", origin="policy")
     if s.startswith("data:"):
         data, mime = _resolve_data_url(s)
         return _finalize(data, mime, "data", s, permitted)

@@ -1231,6 +1231,23 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
     return kwargs
 
 
+def _team_memory_policy() -> str:
+    """"base" (ungoverned/owner: existing behavior), "non-owner" (governed active
+    non-owner: no built-in store), or "denied" (no built-in store, no provider)."""
+    try:
+        from agent import team_authz as _tz
+    except ImportError:
+        return "base"
+    try:
+        _ns = _tz.memory_namespace()
+    except _tz.TeamAuthzDenied:
+        return "denied"
+    except Exception:
+        _ra().logger.warning("team memory policy check failed; disabling memory for this agent", exc_info=True)
+        return "denied"
+    return "base" if _ns is None else "non-owner"
+
+
 def _init_memory(agent, _agent_cfg, skip_memory, platform):
     # Persistent memory (MEMORY.md + USER.md) — loaded from disk
     agent._memory_store = None
@@ -1239,6 +1256,9 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    # Team isolation (HTS-06): a governed non-owner never loads the owner's
+    # built-in MEMORY.md/USER.md store; a denied principal gets no memory at all.
+    _team_mem = _team_memory_policy()
     # skip_memory skips the external *provider*; enabled_toolsets=["memory"] still gets the
     # built-in store so the memory tool never sees store=None.
     # Flush/background agents can still pass enabled_toolsets=["memory"] so the built-in file store exists
@@ -1261,7 +1281,12 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                 _agent_cfg
             )
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
-            if agent._memory_enabled or agent._user_profile_enabled:
+            if _team_mem != "base":
+                # Governed non-owner/denied: the owner's built-in store stays unloaded.
+                agent._memory_enabled = False
+                agent._user_profile_enabled = False
+                agent._memory_store = None
+            elif agent._memory_enabled or agent._user_profile_enabled:
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
@@ -1272,7 +1297,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
 
     # External memory provider plugin (one at a time, alongside built-in): memory.provider.
     agent._memory_manager = None
-    if not skip_memory:
+    if not skip_memory and _team_mem != "denied":
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
             if _mem_provider_name and _mem_provider_name.strip():

@@ -32,6 +32,11 @@ def prepare_send_message_platforms() -> None:
 
 def send_message_tool(args, **kw):
     """Handle cross-channel send_message tool calls."""
+    from agent.team_authz_perimeter import media_payload_denial
+    if denial := media_payload_denial(args):
+        if args.get("sharing_consent_id") and "MEDIA:" in (args.get("message") or ""):
+            denial = "A consented summary carries no attachments. " + denial
+        return tool_error(denial)
     action = args.get("action", "send")
     if action == "list":
         return _handle_list()
@@ -151,6 +156,79 @@ def _authorize_relay_target(platform_name: str, chat_id, thread_id=None, *,
         )
 
 
+def _authorize_team_dispatch(platform_name: str, chat_id, thread_id, message, media_files, args,
+                             *, check_consent: bool = True) -> str | None:
+    """Team outbound gate (HTS-06); None when the send may proceed, else an error string.
+
+    Checked at dispatch against the FINAL resolved destination and exact text:
+    denied principals send nothing; non-owners reach only the originating
+    chat/thread; a consented summary additionally requires its exact author
+    bytes/destination (``authorize_sharing``, whose audit row persists before
+    delivery) and carries no attachments. Owner and ungoverned sends behave
+    exactly as base. Like the relay guard above, a guard that cannot answer
+    refuses.
+
+    ``check_consent=False`` enforces the destination floor only: the dispatch
+    choke point uses it so a consented send is audited exactly once (by the
+    full check where the typed request exists), while every lane still gets
+    the origin-only floor.
+    """
+    try:
+        from agent import team_authz as _tz
+    except ImportError:
+        return None
+    try:
+        if not _tz.is_governed():
+            return None
+        _principal = _tz.resolve_principal()
+        if _principal.denied:
+            return f"Refusing to send: {_principal.deny_reason or 'denied'}"
+        if _principal.is_owner:
+            return None
+        from agent.team_authz_perimeter import media_payload_denial
+        if denial := media_payload_denial({"message": message, "media_files": media_files}):
+            return "Refusing to send: " + denial
+        _target = {"chatId": chat_id}
+        if thread_id is not None:
+            _target["threadId"] = thread_id
+        _decision = _tz.may_send_to(_target)
+        if not _decision.allowed:
+            _label = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
+            return f"Refusing to send to '{_label}': {_decision.reason or 'destination-outside-origin'}"
+        if not check_consent:
+            return None
+        _consent_id = (args or {}).get("sharing_consent_id") if isinstance(args, dict) else None
+        _source_ref = (args or {}).get("sharing_source_ref") if isinstance(args, dict) else None
+        if _consent_id is None and _source_ref is None:
+            return None
+        if not _consent_id or not _source_ref:
+            return ("Refusing to send: incomplete sharing-consent reference "
+                    "(need sharing_consent_id and sharing_source_ref)")
+        if media_files:
+            return "Refusing to send: a consented summary carries no attachments"
+        if "MEDIA:" in (message or ""):
+            return "Refusing to send: a consented summary carries no attachments"
+        try:
+            from agent.team_authz_sharing import authorize_sharing as _authorize_sharing
+        except ImportError:
+            return "Refusing to send: sharing-consent check unavailable"
+        _ctx = _tz.current_requester()
+        _dest = {"shape": "messaging", "platform": platform_name,
+                 "guild": (_ctx.scope_id if _ctx and _ctx.scope_id else ""),
+                 "chatId": chat_id}
+        if thread_id is not None:
+            _dest["threadId"] = thread_id
+        _sdecision = _authorize_sharing(_consent_id, source=_source_ref, summary=message or "",
+                                        destination=_dest)
+        if not _sdecision.allowed:
+            return f"Refusing to send consented summary: {_sdecision.reason or 'consent-denied'}"
+        return None
+    except Exception:  # noqa: BLE001 - the guard faulted; FAIL CLOSED
+        logger.exception("team send authorization FAILED — refusing the send")
+        return ("Refusing to send: the team authorization check failed, so this destination "
+                "could not be verified.")
+
+
 def _handle_react(args, remove=False):
     """Attach (``remove=True``: retract) an emoji reaction via the live gateway adapter; no
     standalone fallback because reacting needs the adapter's live message-id state."""
@@ -183,6 +261,11 @@ def _handle_react(args, remove=False):
     _relay_denial = _authorize_relay_target(platform_name, chat_id, _thread_id)
     if _relay_denial:
         return tool_error(_relay_denial)
+    # HTS-06: a reaction is outbound to a named destination, so the same
+    # origin-only floor applies (reactions carry no text, attachments or consent).
+    _team_denial = _authorize_team_dispatch(platform_name, chat_id, _thread_id, "", None, None)
+    if _team_denial:
+        return tool_error(_team_denial)
 
     _, adapter = _live_adapter(platform)
     if adapter is None:
@@ -260,6 +343,12 @@ def _handle_send(args):
                                             native_token=getattr(pconfig, "token", None))
     if _relay_denial:
         return tool_error(_relay_denial)
+    # HTS-06: full team gate (destination floor + consented-summary exactness)
+    # against the final resolved destination and exact text, before dispatch.
+    _team_denial = _authorize_team_dispatch(platform_name, chat_id, thread_id, cleaned_message,
+                                            media_files, args)
+    if _team_denial:
+        return tool_error(_team_denial)
 
     try:
         from model_tools import _run_async
@@ -682,6 +771,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
+    _team_denial = _authorize_team_dispatch(platform_name, chat_id, thread_id, message, media_files, args,
+                                            check_consent=False)
+    if _team_denial is not None:
+        return {"error": _team_denial}
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
     # Telegram chunks internally on the *formatted* text (escaping inflates length).

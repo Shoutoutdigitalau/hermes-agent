@@ -46,6 +46,12 @@ _ALLOW_BOTS_ENV = {
     Platform.SLACK: "SLACK_ALLOW_BOTS",
 }
 
+# Fixed user-facing refusal for team-authorization denials at gateway entry (HTS-02).
+# Identical for every deny reason: the reason is logged and audited server-side, never
+# disclosed, so register membership is not probeable through the reply text. Flat
+# "I can't" wording with no approval route (T1, operator D1 resolution 2026-09-18).
+TEAM_AUTHZ_DENY_REPLY = "I can't take requests from this account."
+
 
 # Gate reads use the shared per-profile isolated reader (allowlist leak under multiplex, #72348).
 from gateway.platforms._shared import decode_json_list_literal as _decode_json_list_literal  # noqa: E402
@@ -665,3 +671,72 @@ class GatewayAuthorizationMixin:
         if any(key and _auth_env(key).strip() for key in allowlist_keys):
             return "ignore"
         return "pair"
+
+    # ── team authorization at gateway entry (HTS-02) ──────────────────────────
+    # Binds the governed transport identity beside the turn / background-task
+    # entry points and refuses denied principals before any transcript read,
+    # agent build or model call. Identity comes ONLY from the transport
+    # SessionSource (user_id / scope_id); display names and role_authorized are
+    # never inputs here. Ungoverned sessions always proceed unchanged.
+
+    def _team_authz_bind_requester(self, source: SessionSource):
+        """Bind the transport requester for this turn/task.
+
+        Returns the reset token for ``_team_authz_reset_requester`` (call it in
+        a ``finally``). ``agent.team_authz`` is imported lazily (cycle + cost).
+        """
+        from agent.team_authz import bind_requester
+        return bind_requester(source)
+
+    def _team_authz_reset_requester(self, token) -> None:
+        """Release a ``_team_authz_bind_requester`` token; tolerates ``None``."""
+        if token is None:
+            return
+        from agent.team_authz import reset_requester
+        with contextlib.suppress(Exception):
+            reset_requester(token)
+
+    def _team_authz_audit_deny(self, reason: str) -> None:
+        """One redacted audit row for a gateway-entry denial (best effort)."""
+        from agent import team_authz as _ta
+        principal = _ta.resolve_principal()
+        ctx = _ta.current_requester()
+        with contextlib.suppress(Exception):
+            _ta.audit({
+                "event": "turn",
+                "policyVersion": principal.policy_version or "",
+                "memberKey": principal.member_key,
+                "discordUserId": principal.discord_user_id or (ctx.user_id if ctx else None),
+                "scope": ctx.scope_id if ctx else None,
+                "decision": "denied",
+                "reason": reason,
+            })
+
+    def _team_authz_turn_deny_reply(self, source: SessionSource, *, inbound_text=None) -> Optional[str]:
+        """Fixed refusal for a governed denied principal, else ``None`` to proceed."""
+        from agent.team_authz import is_governed, resolve_principal, log_inbound
+        if not is_governed():
+            return None
+        if inbound_text is not None and not log_inbound(summary=str(inbound_text)):
+            return TEAM_AUTHZ_DENY_REPLY
+        principal = resolve_principal()
+        if not principal.denied:
+            return None
+        self._team_authz_audit_deny(principal.deny_reason)
+        _platform = getattr(source, "platform", None)
+        logger.warning(
+            "team-authz: denied %s turn for user_id=%s scope=%s: %s",
+            getattr(_platform, "value", _platform),
+            getattr(source, "user_id", None), getattr(source, "scope_id", None),
+            principal.deny_reason,
+        )
+        return TEAM_AUTHZ_DENY_REPLY
+
+    def _team_authz_governed_non_owner(self) -> bool:
+        """True when the bound requester is governed and not the active owner.
+
+        Drives owner-context exclusion (context files, soul identity) and fails
+        closed for denied principals (they never reach an agent build anyway).
+        """
+        from agent.team_authz import is_governed, resolve_principal
+        return bool(is_governed() and not resolve_principal().is_owner)

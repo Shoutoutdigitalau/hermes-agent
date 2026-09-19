@@ -632,6 +632,10 @@ def _url_policy_error(url: str, *, auto_local: bool = False) -> Optional[dict]:
     magic links, OAuth callbacks and signed CDN assets are how the agent signs in and browses, and
     a cloud browser already sees every cookie and typed password of the session — refusing the
     URL protects nothing. Hermes' own secrets leaking into a URL are caught by ``_secret_url_error``."""
+    from agent.team_authz_perimeter import browser_url_denial
+    denied = browser_url_denial(url)
+    if denied:
+        return _err(denied)
     local = _cloud._is_local_backend()
     # Always-blocked floor: cloud metadata / IMDS endpoints are denied regardless of backend, hybrid
     # routing, or allow_private_urls. There's no legitimate agent use case for navigating to 169.254.169.254
@@ -674,12 +678,14 @@ _BOT_DETECTION_TITLE_PATTERNS = (
 
 def _post_redirect_block(nav_session_key: str, url: str, final_url: str, auto_local_this_nav: bool) -> Optional[str]:
     """Post-redirect SSRF check; blocked JSON payload or None. The page is moved to about:blank
-    first so later snapshots can't read the internal content. The metadata floor fires for
-    every backend; the private-address check is skipped for local, the sidecar, and
-    ``browser.allow_private_urls``."""
-    if not final_url or final_url == url:
+    first so later snapshots can't read the internal content. Governed members
+    always get public-only checks. Owner/ungoverned local exceptions remain."""
+    from agent.team_authz_perimeter import browser_url_denial
+    if browser_url_denial(final_url):
+        what = "a private or unverifiable address"
+    elif not final_url or final_url == url:
         return None
-    if _is_always_blocked_url(final_url):
+    elif _is_always_blocked_url(final_url):
         what = "a cloud metadata endpoint"
     elif (
         not _cloud._is_local_backend()
@@ -860,7 +866,13 @@ def _guarded_action(task_id: Optional[str], action: str, command: str, args: lis
     blocked = _blocked_private_page_action(effective_task_id, action)
     if blocked is not None:
         return blocked
-    return _tool_response(_session._run_browser_command(effective_task_id, command, args), ok, err)
+    result = _session._run_browser_command(effective_task_id, command, args)
+    from agent.team_authz_perimeter import member_browser_restricted
+    if member_browser_restricted():
+        blocked = _blocked_private_page_content(effective_task_id)
+        if blocked is not None:
+            return blocked
+    return _tool_response(result, ok, err)
 
 
 def _at_ref(ref: str) -> str:

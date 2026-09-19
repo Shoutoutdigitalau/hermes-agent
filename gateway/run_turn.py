@@ -2064,7 +2064,12 @@ class GatewayTurnMixin:
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
-        """Inner handler that runs under the _running_agents sentinel guard."""
+        """Inner handler that runs under the _running_agents sentinel guard.
+
+        HTS-02: binds the transport requester for the turn; governed denied
+        principals are refused before any transcript read, agent build or model
+        call (see ``_handle_message_with_agent_authorized``).
+        """
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -2079,6 +2084,34 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        _team_token = self._team_authz_bind_requester(source)
+        try:
+            return await self._handle_message_with_agent_authorized(
+                event, source, session_entry, session_key, _quick_key, run_generation,
+                _msg_start_time=_msg_start_time, _platform_name=_platform_name,
+            )
+        finally:
+            self._team_authz_reset_requester(_team_token)
+
+    async def _handle_message_with_agent_authorized(
+        self, event, source, session_entry, session_key, _quick_key, run_generation,
+        _msg_start_time: float = 0.0, _platform_name: str = "",
+    ):
+        """Post-bind turn body: refuse governed denied principals, else run the turn."""
+        from agent.team_authz import TeamAuthzDenied
+        from gateway.authz_mixin import TEAM_AUTHZ_DENY_REPLY
+        from gateway.profile_routing import ProfileRouteRejected
+        try:
+            # The gate reads the served profile's config/register, so it runs
+            # under that profile's scope when multiplexed (no-op otherwise).
+            with self._profile_scope_for_source(source):
+                _deny_reply = self._team_authz_turn_deny_reply(source, inbound_text=getattr(event, "text", ""))
+        except ProfileRouteRejected:
+            # Routing rejects this source: check unscoped; the turn still fails
+            # closed downstream with the established error reply.
+            _deny_reply = self._team_authz_turn_deny_reply(source, inbound_text=getattr(event, "text", ""))
+        if _deny_reply is not None:
+            return _deny_reply
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -2175,6 +2208,11 @@ class GatewayTurnMixin:
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
             )
 
+        except TeamAuthzDenied as e:
+            # Governed toolset trap (override exception / empty result): refuse with
+            # the fixed reply. No agent was built and no model was called.
+            logger.warning("team-authz: denied turn for session %s: %s", session_key, e)
+            return TEAM_AUTHZ_DENY_REPLY
         except Exception as e:
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
@@ -2269,29 +2307,57 @@ class GatewayTurnMixin:
         event_message_id: Optional[str] = None, media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
     ) -> None:
-        """Profile-scoping wrapper around the background agent task (mirrors ``_run_agent``)."""
+        """Profile-scoping wrapper around the background agent task (mirrors ``_run_agent``).
+
+        HTS-02: also binds the transport requester inside the profile scope so the
+        governed principal check sees the served profile's config and register.
+        """
         with self._profile_scope_for_source(source):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
+            _team_token = self._team_authz_bind_requester(source)
+            try:
+                return await self._run_background_task_inner(
+                    prompt, source, task_id, event_message_id, media_urls, media_types,
+                )
+            finally:
+                self._team_authz_reset_requester(_team_token)
 
     def _resolve_enabled_toolsets_for_source(
         self, user_config: dict, source: "SessionSource", platform_key: str,
     ) -> list:
         """Enabled toolsets for an agent run, honoring an adapter ``toolsets_for_source()`` override
         validated through the SAME ``_get_platform_tools`` path (unknown / platform-restricted
-        toolsets dropped, not trusted)."""
+        toolsets dropped, not trusted).
+
+        HTS-02: in a governed session an override exception or an empty toolset
+        result is a denial (``TeamAuthzDenied``), never the platform bundle.
+        Ungoverned sessions keep the base fallback exactly.
+        """
+        from agent.team_authz import TeamAuthzDenied, is_governed
         from hermes_cli.tools_config import _get_platform_tools
         try:
             adapter = self._adapter_for_source(source)
             override = adapter.toolsets_for_source(source) if adapter is not None else None
         except Exception:
             override = None
+            override_raised = True
+        else:
+            override_raised = False
+        if is_governed():
+            if override_raised:
+                self._team_authz_audit_deny("toolset-override-error")
+                raise TeamAuthzDenied("toolset-override-error")
+            if isinstance(override, list) and not override:
+                self._team_authz_audit_deny("empty-toolsets")
+                raise TeamAuthzDenied("empty-toolsets")
         if override and isinstance(override, list):
             pts = dict(user_config.get("platform_toolsets") or {})
             pts[platform_key] = [str(x) for x in override]
             user_config = {**user_config, "platform_toolsets": pts}
-        return sorted(_get_platform_tools(user_config, platform_key))
+        resolved = sorted(_get_platform_tools(user_config, platform_key))
+        if is_governed() and not resolved:
+            self._team_authz_audit_deny("empty-toolsets")
+            raise TeamAuthzDenied("empty-toolsets")
+        return resolved
 
     def _resolve_turn_toolsets(self, user_config: dict, source: "SessionSource", platform_key: str):
         """``(enabled_toolsets, disabled_toolsets)`` for an agent run on ``source``."""
@@ -2306,6 +2372,7 @@ class GatewayTurnMixin:
         media_types: Optional[List[str]] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
+        from agent.team_authz import TeamAuthzDenied
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _load_gateway_config,
             _platform_config_key,
@@ -2320,6 +2387,12 @@ class GatewayTurnMixin:
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
         try:
+            # HTS-02: governed denied principals are refused before any config load,
+            # agent build or model call.
+            _team_deny = self._team_authz_turn_deny_reply(source, inbound_text=prompt)
+            if _team_deny is not None:
+                await adapter.send(source.chat_id, _team_deny, metadata=_thread_metadata)
+                return
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
             if not runtime_kwargs.get("api_key"):
@@ -2352,6 +2425,8 @@ class GatewayTurnMixin:
                 except Exception as e:
                     logger.warning("Background task vision enrichment failed: %s", e)
 
+            _team_skip_ctx = self._team_authz_governed_non_owner()
+
             def run_sync():
                 agent = AIAgent(
                     model=turn_route["model"],
@@ -2380,6 +2455,8 @@ class GatewayTurnMixin:
                     # Reload from disk — do not reuse the startup snapshot.
                     # See #60955.
                     fallback_model=self._refresh_fallback_model(),
+                    # HTS-02: governed non-owner background agents exclude owner context.
+                    skip_context_files=_team_skip_ctx,
                 )
                 try:
                     return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
@@ -2433,6 +2510,17 @@ class GatewayTurnMixin:
                         )
                         await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
 
+        except TeamAuthzDenied as e:
+            # Governed toolset trap (override exception / empty result): refuse with
+            # the fixed reply, already audited at the trap. No agent was built.
+            from gateway.authz_mixin import TEAM_AUTHZ_DENY_REPLY
+            logger.warning("team-authz: denied background task %s: %s", task_id, e)
+            with suppress(Exception):
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=TEAM_AUTHZ_DENY_REPLY,
+                    metadata=_thread_metadata,
+                )
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             # Automatic failure diagnostic (the task produced no requested result to deliver).

@@ -73,6 +73,27 @@ def _is_client_error(exc: Exception) -> bool:
     return type(exc).__name__ in _CLIENT_ERROR_TYPES or any(s in err_str for s in ("404", "not found", "valid uuid"))
 
 
+def _team_memory_namespace() -> tuple:
+    """(namespace_or_None, deny_reason_or_None) for team isolation (HTS-06).
+
+    ``(None, None)`` means ungoverned or owner: the existing user_id precedence
+    stands. A denied principal yields ``(None, reason)`` and must get no
+    provider recall or write. A missing team_authz module (pure base tree) is
+    base behavior.
+    """
+    try:
+        from agent import team_authz as _tz
+    except ImportError:
+        return (None, None)
+    try:
+        return (_tz.memory_namespace(), None)
+    except _tz.TeamAuthzDenied as exc:
+        return (None, str(exc) or "denied")
+    except Exception:
+        logger.warning("team memory namespace check failed; denying provider recall", exc_info=True)
+        return (None, "policy-error")
+
+
 def _load_config() -> dict:
     """Env vars provide defaults; $HERMES_HOME/mem0.json overrides individual keys.
     Layering avoids a silent failure when the JSON file exists but lacks fields
@@ -129,6 +150,7 @@ class Mem0MemoryProvider(MemoryProvider):
     def __init__(self):
         self._config = self._backend = self._sync_thread = self._prefetch_thread = None
         self._mode, self._api_key, self._host, self._user_id, self._agent_id = "platform", "", "", _DEFAULT_USER_ID, "hermes"
+        self._team_denied_reason = None  # HTS-06: set when initialize() runs under a denied principal
         self._rerank_default, self._channel = False, "cli"  # channel = gateway name (cli/telegram/discord/...)
         self._sync_max_chars = _SYNC_MSG_MAX_CHARS
         self._prefetch_query = self._prefetch_result = ""
@@ -231,24 +253,50 @@ class Mem0MemoryProvider(MemoryProvider):
         # The literal placeholder counts as unset so wizard users still get gateway-native ids.
         configured = cfg.get("user_id")
         self._user_id = (None if configured == _DEFAULT_USER_ID else configured) or kwargs.get("user_id") or _DEFAULT_USER_ID
+        # Team isolation (HTS-06): the namespace derives from the verified member
+        # identity, never the configured fixed id; a denied principal gets no provider.
+        self._team_denied_reason = None
+        _team_ns, _team_deny = _team_memory_namespace()
+        if _team_deny is not None:
+            self._team_denied_reason = _team_deny
+            self._user_id = _DEFAULT_USER_ID
+        elif _team_ns is not None:
+            self._user_id = _team_ns
         # Persisted rerank preference: default for mem0_search when the model omits ``rerank``. Platform-only.
         _rr = cfg.get("rerank", False)
         self._rerank_default = _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
         self._channel = kwargs.get("platform") or "cli"
         self._sync_max_chars = int(cfg.get("sync_max_chars") or _SYNC_MSG_MAX_CHARS)
-        self._backend = self._create_backend()
+        self._backend = None if self._team_denied_reason is not None else self._create_backend()
         if self._backend and not self._atexit_registered:
             atexit.register(self._shutdown_backend)
             self._atexit_registered = True
 
+    def _team_deny_reason(self) -> str | None:
+        """Non-None when team policy forbids any provider recall/write right now.
+
+        Re-resolved per call so a mid-session revocation binds on the next
+        operation with zero backend calls. Never raises.
+        """
+        if getattr(self, "_team_denied_reason", None) is not None:
+            return self._team_denied_reason
+        return _team_memory_namespace()[1]
+
+    def _effective_user_id(self) -> str:
+        """Per-call user id: the verified member namespace wins over the stored id."""
+        _team_ns, _team_deny = _team_memory_namespace()
+        if _team_deny is not None or _team_ns is None:
+            return self._user_id
+        return _team_ns
+
     def _search(self, query: str, top_k: int = 10, rerank: bool = False, backend=None) -> list:
         # Scoped to user_id only — by design — so recall surfaces memories from any gateway/agent under this
         # principal; writes attach agent_id and metadata.channel so narrower views remain possible at query time.
-        return (backend or self._backend).search(query, filters={"user_id": self._user_id}, top_k=top_k, rerank=rerank)
+        return (backend or self._backend).search(query, filters={"user_id": self._effective_user_id()}, top_k=top_k, rerank=rerank)
 
     def _add(self, messages: list, infer: bool):
         metadata = {"channel": self._channel} if self._channel else {}
-        return self._backend.add(messages, user_id=self._user_id, agent_id=self._agent_id, infer=infer, metadata=metadata)
+        return self._backend.add(messages, user_id=self._effective_user_id(), agent_id=self._agent_id, infer=infer, metadata=metadata)
 
     def system_prompt_block(self) -> str:
         # Mirror _create_backend precedence (oss > host > platform). Rerank is a Mem0 Platform feature only.
@@ -271,8 +319,12 @@ class Mem0MemoryProvider(MemoryProvider):
         backend = self._backend
         if not query or backend is None or self._is_breaker_open():
             return
+        if self._team_deny_reason() is not None:
+            return
 
         def _run():
+            if self._team_deny_reason() is not None:
+                return
             results = self._try(lambda: self._search(query, backend=backend), logger.debug, "Mem0 prefetch failed: %s")
             lines = [r.get("memory", "") for r in (results or []) if r.get("memory")]
             body = "## Mem0 Memory\n" + "\n".join(f"- {l}" for l in lines) if lines else ""
@@ -290,6 +342,8 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall memories for the CURRENT question with a short hot-path wait."""
+        if self._team_deny_reason() is not None:
+            return ""
         if (cached := self._consume_prefetch_result(query)) is not None:
             return cached
         self._start_prefetch(query)
@@ -303,8 +357,12 @@ class Mem0MemoryProvider(MemoryProvider):
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
         if self._backend is None or self._is_breaker_open():
             return
+        if self._team_deny_reason() is not None:
+            return
 
         def _sync():
+            if self._team_deny_reason() is not None:
+                return
             if self._backend is not None:
                 messages = [
                     {"role": "user", "content": _truncate_for_sync(user_content, self._sync_max_chars)},
@@ -353,6 +411,8 @@ class Mem0MemoryProvider(MemoryProvider):
     }
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        if (deny := self._team_deny_reason()) is not None:
+            return tool_error(f"Mem0 access denied: {deny}")
         if self._backend is None:
             err = getattr(self, "_init_error", "unknown error")
             return json.dumps({"error": f"Mem0 backend not initialized: {err}.{self._oss_hint(' Check that {vs} is running and reachable.')}"})

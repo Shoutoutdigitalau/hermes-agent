@@ -260,7 +260,15 @@ def _tool_defs_cache_key(
     Covers every argument plus everything that changes the result without one:
     registry generation, config.yaml stat signature (dynamic schemas), kanban
     context, profile scope. check_fn results are TTL-cached in the registry.
+    Governed sessions bypass the cache: the discovery filter is per-requester,
+    so a cached member-filtered list must never serve another principal.
     """
+    try:
+        from agent.team_authz import is_governed as _ta_governed
+        if _ta_governed():
+            return None
+    except Exception:
+        pass
     profile_scope = check_fn_cache_scope()
     if profile_scope == CHECK_FN_CACHE_BYPASS:
         return None
@@ -497,10 +505,26 @@ _TOOL_SEARCH_LISTING_FORMS = {
 }
 
 
+def _team_authz_filter_discovery(names: set) -> set:
+    """Discovery perimeter: a governed principal only sees tools its role could
+    use. Ungoverned sessions keep the full selection (byte-identical base)."""
+    try:
+        from agent import team_authz as _ta
+    except Exception:
+        return names  # policy module missing; execution seams still fail closed
+    try:
+        if not _ta.is_governed():
+            return names
+        return set(_ta.filter_tool_names(names))
+    except Exception:
+        return set()
+
+
 def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
                               quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     tools_to_include = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
+    tools_to_include = _team_authz_filter_discovery(tools_to_include)
     # Selection is per schema, not per process/profile. Kanban's local checks
     # are uncached; the outer definitions cache already keys on this selection.
     from tools.kanban_toolset_context import scoped_kanban_toolset_selection
@@ -613,6 +637,161 @@ _LEGACY_TOOL_ALIASES = {
     "tour": "gui_tour", "tip": "show_tip",
 }
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
+
+
+# --- Team authorization enforcement (mission hermes-team-security-20260917, HTS-03) ---
+# Single enforcement helper for every HTS-03-owned seam (discovery, dispatch,
+# inline/delegate/context-engine/memory branches, vault, connectors).
+# Policy lives ONLY in agent/team_authz*.py (HTS-01, accepted); this layer calls
+# it first on raw arguments and again on final transformed arguments before any
+# backend is touched. Ungoverned (feature disabled) => None => base behaviour.
+# Mission hermes-team-policy-simplify-20260918 (T1): the owner-only action
+# allowlist and the unknown/unmapped connector denial are removed — an unmapped
+# tool or connector is ordinary team work; protected classes deny in the core.
+# Destination fields a sharing consent may bind; anything else on a
+# publication destination is unconsented content (mirrors the consent shape).
+_TEAM_AUTHZ_DEST_FIELDS = frozenset({
+    "shape", "platform", "guild", "chatId", "threadId", "connector",
+    "connectionId", "account", "resource", "field",
+})
+_TEAM_AUTHZ_CONSENT_ID_KEYS = ("sharingConsentId", "consentId", "consent_id")
+_TEAM_AUTHZ_ATTACHMENT_KEYS = ("attachments", "attachment", "files", "media", "images")
+# Non-content arg keys a publication sink may carry besides the consented
+# (source, summary, destination) triple + consent reference; mapped transport
+# keys from the register row are added when the row is readable.
+_TEAM_AUTHZ_SINK_TRANSPORT_KEYS = frozenset({
+    "source", "sourceRef", "summary", "destination",
+    "sharingConsentId", "consentId", "consent_id",
+    "connectionId", "account", "amount", "currency",
+})
+
+
+@dataclass(frozen=True)
+class _TeamAuthzDeny:
+    """Deny verdict when agent.team_authz itself is unreachable (fail closed)."""
+
+    allowed: bool = False
+    reason: str = ""
+    action: Optional[str] = None
+    message: Optional[str] = None
+
+
+def _team_authz_sink_row(tool_name: str):
+    """First register toolActions row matching *tool_name*, or None.
+
+    Read-only lookup for transport-key exemptions; authorization itself always
+    goes through agent.team_authz. None when unmapped or unreadable.
+    """
+    try:
+        import fnmatch as _fnm
+        from agent.team_authz import register_path as _reg_path
+        with open(_reg_path(), encoding="utf-8") as _f:
+            _reg = json.load(_f)
+        for _row in _reg.get("toolActions", []) or []:
+            if isinstance(_row, dict) and _fnm.fnmatchcase(tool_name, str(_row.get("pattern", ""))):
+                return _row
+    except Exception:
+        pass
+    return None
+
+
+def _team_authz_sink_denied(tool_name: str, args: dict, ctx) -> Optional[Any]:
+    """Require author consent for private-origin mapped writes, not model labels.
+
+    Legacy publication envelopes retain their strict field validation. Private
+    writes bind the complete canonical payload and trusted transport origin,
+    including mapped sinks without a connectors__ name.
+    """
+    from agent import team_authz as _ta
+    from agent.team_authz_sharing import connector_publication_binding, authorize_sharing
+    row = _team_authz_sink_row(tool_name)
+    if row is None:
+        return None
+    ctx = ctx or _ta.current_requester()
+    principal = _ta.resolve_principal(ctx)
+    mapped_write = (row.get("connectionId") or row.get("publicationSink")) and not str(
+        row.get("action", "")).endswith((".read", ".search"))
+    private_sink = bool(mapped_write and ctx and ctx.chat_type == "dm" and not principal.is_owner)
+    legacy = "destination" in args and (
+        "summary" in args or any(args.get(k) for k in _TEAM_AUTHZ_CONSENT_ID_KEYS))
+    if not private_sink and not legacy:
+        return None
+    if legacy:
+        dest = args.get("destination")
+        if not isinstance(dest, dict):
+            return _ta.Decision(False, "consent-destination-invalid")
+        if any(key not in _TEAM_AUTHZ_DEST_FIELDS for key in dest):
+            return _ta.Decision(False, "consent-extra-destination-fields")
+        if any(args.get(key) for key in _TEAM_AUTHZ_ATTACHMENT_KEYS):
+            return _ta.Decision(False, "consent-attachments-denied")
+        allowed_keys = set(_TEAM_AUTHZ_SINK_TRANSPORT_KEYS)
+        for transport in (row.get("accountArg"), row.get("amountArg"), row.get("currencyArg")):
+            if transport:
+                allowed_keys.add(transport)
+        if any(k not in allowed_keys for k in args):
+            return _ta.Decision(False, "consent-extra-fields")
+    consent_id = next((args.get(k) for k in _TEAM_AUTHZ_CONSENT_ID_KEYS if args.get(k)), None)
+    if not isinstance(consent_id, str) or not consent_id:
+        return _ta.Decision(False, "consent-required", message="Please confirm the exact payload before I share information from this private conversation.")
+    if private_sink:
+        origin, payload, destination = connector_publication_binding(tool_name, args, row, ctx)
+    else:
+        payload = args.get("summary")
+        if not isinstance(payload, str):
+            return _ta.Decision(False, "consent-summary-missing")
+        origin = args.get("source", args.get("sourceRef", ""))
+        destination = args["destination"]
+    decision = authorize_sharing(consent_id, source=origin, summary=payload,
+                                 destination=destination, ctx=ctx)
+    return None if decision.allowed else decision
+
+
+def team_authz_denied(tool_name: str, args: Optional[Dict[str, Any]] = None, ctx=None, *, reserve: bool = False) -> Optional[Any]:
+    """HTS-03 enforcement gate. None => proceed; Decision-like => deny now.
+
+    Order: governed? -> authorize_tool (protected classes before mutable
+    mappings, exact owner approval only, audit-before-allow) ->
+    publication-sink consent (r2). Owner identity comes ONLY from the verified
+    requester (D1); caller-supplied or transformed flags are never consulted.
+    Any failure denies with zero backend calls. Callers run this on raw args
+    AND on final transformed args.
+    """
+    call_args = args if isinstance(args, dict) else {}
+    try:
+        from agent import team_authz as _ta
+    except Exception as exc:
+        return _TeamAuthzDeny(reason=f"policy-error:{type(exc).__name__}")
+    try:
+        if not _ta.is_governed(ctx):
+            return None
+        decision = _ta.authorize_tool(tool_name, call_args, ctx, reserve=False)
+        if not decision.allowed:
+            return decision
+        sink_denied = _team_authz_sink_denied(tool_name, call_args, ctx)
+        if sink_denied is not None:
+            return sink_denied
+        if _ta.authorization_mode() == "shadow":
+            return _ta.Decision(False, "shadow-only", decision.action,
+                                message="Shadow decision recorded; no tool was executed.")
+        if reserve:
+            decision = _ta.authorize_tool(tool_name, call_args, ctx, reserve=True)
+            if not decision.allowed:
+                return decision
+        return None
+    except Exception as exc:
+        return _TeamAuthzDeny(reason=f"policy-error:{type(exc).__name__}")
+
+
+def team_authz_deny_text(denied: Any) -> str:
+    """Human/model-facing deny text: the core message verbatim + reason code."""
+    reason = getattr(denied, "reason", "") or "denied"
+    message = getattr(denied, "message", None)
+    return f"{message} [{reason}]" if message else f"I can't run that tool. [{reason}]"
+
+
+def team_authz_deny_result(denied: Any) -> str:
+    """JSON ``{"error": ...}`` deny result; the backend is never touched."""
+    return tool_error(team_authz_deny_text(denied))
 
 
 # --- Tool error sanitization --------------------------------------------------
@@ -830,6 +1009,9 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         from tools.connectors import dispatch_connector_call, is_connector_name
         if is_connector_name(function_name):
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
+        denied = team_authz_denied(function_name, next_args, reserve=True)
+        if denied is not None:
+            return team_authz_deny_result(denied)
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
@@ -894,6 +1076,15 @@ def handle_function_call(
                                   **asdict(ids), middleware_trace=list(trace), **extra)
         return result
 
+    # Team authorization runs FIRST on the raw call: before the Tool Search
+    # bridge, connector routing, middleware and hooks. Unwrapped tool_call
+    # targets and batch entries re-enter here and are guarded per item.
+    _ta_denied = team_authz_denied(function_name, function_args)
+    if _ta_denied is not None:
+        return _emit(team_authz_deny_result(_ta_denied), duration_ms=_elapsed_ms(start),
+                     status="blocked", error_type="team_authz_denied",
+                     error_message=getattr(_ta_denied, "reason", "denied"))
+
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
     # approval, guardrails) sees the real tool name, never the bridge.
@@ -944,6 +1135,15 @@ def handle_function_call(
                 notify_other_tool_call(task_id or "default")
             except Exception:
                 pass  # file_tools may not be loaded yet
+
+        # Recheck on the FINAL transformed arguments immediately before backend
+        # dispatch: middleware and pre-dispatch hooks may rewrite args or launder
+        # a protected call into an ordinary shape. Any denial stops here.
+        _ta_final = team_authz_denied(function_name, function_args)
+        if _ta_final is not None:
+            return _emit(team_authz_deny_result(_ta_final), duration_ms=_elapsed_ms(start),
+                         status="blocked", error_type="team_authz_denied",
+                         error_message=getattr(_ta_final, "reason", "denied"))
 
         # duration_ms (monotonic) is exposed to post_tool_call / transform_tool_result.
         start = time.monotonic()
