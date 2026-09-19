@@ -355,7 +355,7 @@ A child that exhausts its budget returns with `exit_reason: max_iterations` and 
 
 By default there is **no wall-clock timeout** on subagents. Children fail only from what they're actually doing — API errors, tool errors, or hitting their iteration budget — never from a delegation-level stopwatch. Earlier releases shipped a hard cap (300s, later 600s), which kept killing legitimately busy children mid-task: deep code reviews, large research fan-outs, and slow reasoning models routinely need more than 10 minutes while making steady progress the whole time.
 
-Genuinely stuck children are still detected: the heartbeat staleness monitor stops refreshing the parent's activity when a child makes no progress (no API calls, no tool starts, and no activity-timestamp ticks), letting the gateway inactivity timeout fire on a truly wedged worker. An in-flight model wait still counts as progress — subagents refresh the activity clock while waiting on the provider, so a slow local / long-prefill completion is not treated as stalled.
+Genuinely stuck children are still detected on every runtime, with or without a configured cap: the heartbeat staleness monitor watches each child's progress signals (API calls, tool starts, activity-timestamp ticks). A child whose progress is completely frozen past the stale threshold — 450s idle between turns, 1200s while inside a tool — is interrupted and its wait is **abandoned**: the parent gets a `status: "timeout"` entry whose error reads `Subagent stopped making progress after N API call(s) — no activity for 450s (heartbeat stale threshold); the pending worker was abandoned.` The wait ends even in one-shot runs (`hermes chat -Q`, Bot Chat one-shot, cron) that have no gateway inactivity watchdog behind them, so a wedged child can no longer hold the turn or its session lease forever. An in-flight model wait still counts as progress — subagents refresh the activity clock while waiting on the provider, so a slow local / long-prefill completion is not treated as stalled.
 
 If you want a hard cap anyway (e.g. cost control on unattended cron-driven delegation), opt in per-install:
 
@@ -367,13 +367,14 @@ delegation:
 
 A positive value enforces a hard wall-clock limit on each child; `0` or a negative value disables it.
 
-When a configured cap fires, the child's result carries structured timeout
-metadata alongside the error message so parents and hooks can distinguish a
-stopwatch kill from other failures without parsing text: `timeout_seconds`
-(the configured cap), `timed_out_after_seconds` (actual wall clock), and
-`timeout_phase` (`before_first_llm_call` when the child never reached its
-first request, `after_llm_calls` otherwise). All three are `null` on
-non-timeout errors.
+When a configured cap or the stale threshold fires, the child's result carries
+structured timeout metadata alongside the error message so parents and hooks
+can distinguish a stopwatch kill from other failures without parsing text:
+`timeout_seconds` (whichever limit actually ended the wait — the stale
+threshold when it pre-empts a longer configured cap, otherwise the cap),
+`timed_out_after_seconds` (actual wall clock), and `timeout_phase`
+(`before_first_llm_call` when the child never reached its first request,
+`after_llm_calls` otherwise). All three are `null` on non-timeout errors.
 
 ## Failure Visibility
 
@@ -450,7 +451,7 @@ Press **F7** in the Classic CLI or TUI composer to toggle the dock between its m
 
 The live transcript tail is a bounded recent excerpt, not an unlimited conversation browser. A child leaving the live registry leaves the dock; completion messages and the TUI/Desktop history views remain the place to review finished work. Latest activity is an observation, not a percentage-complete estimate.
 
-The classic CLI's `/agents` and `/tasks` commands still print a text summary; **Ctrl+T** (or **F6**) is the immediate interactive monitor, including while the parent is busy. See [TUI — Slash commands](/user-guide/tui#slash-commands).
+The classic CLI's `/agents` and `/tasks` commands still print a text summary; **Ctrl+T** (or **F6**) is the immediate interactive monitor, including while the parent is busy. See [TUI — Slash commands](../tui.md#slash-commands).
 
 On the classic CLI and every gateway platform (Telegram, Discord, Slack, ...),
 `/agents` also lists **background delegations with live per-child activity**,
@@ -490,7 +491,7 @@ Control actions run synchronously in-turn (never backgrounded), are scoped to th
 
 ### From the TUI / gateway (session-facing)
 
-`steer_subagent(subagent_id, text)` in `tools/delegate_tool_registry.py` is the redirection-side mirror of `interrupt_subagent()`: it queues text into a live child through the same mechanism as [`/steer`](/reference/slash-commands) — the text is appended to the child's last tool result at its next iteration boundary, the in-flight tool call is never cut, and the child sees it as an out-of-band user message. Programmatic hosts reach it through the session-scoped `subagent.steer` gateway RPC, which sits beside `subagent.interrupt`:
+`steer_subagent(subagent_id, text)` in `tools/delegate_tool_registry.py` is the redirection-side mirror of `interrupt_subagent()`: it queues text into a live child through the same mechanism as [`/steer`](../../reference/slash-commands.md) — the text is appended to the child's last tool result at its next iteration boundary, the in-flight tool call is never cut, and the child sees it as an out-of-band user message. Programmatic hosts reach it through the session-scoped `subagent.steer` gateway RPC, which sits beside `subagent.interrupt`:
 
 ```json
 {"method": "subagent.steer", "params": {"session_id": "owning-ui-session", "subagent_id": "sa-0-1a2b3c4d", "text": "focus on pricing instead"}}

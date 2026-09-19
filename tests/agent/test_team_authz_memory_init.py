@@ -106,6 +106,9 @@ def bound(ctx):
 def _agent(session_id="sess-hts06"):
     agent = SimpleNamespace(
         session_id=session_id,
+        # upstream _init_memory reads agent.session_cwd (agent_init.py:1224);
+        # added after this overlay's base snapshot.
+        session_cwd=None,
         enabled_toolsets=[],
         disabled_toolsets=[],
         _session_db=None,
