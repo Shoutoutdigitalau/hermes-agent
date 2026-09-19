@@ -11,6 +11,7 @@ import threading
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
+from agent import team_authz
 from agent.interrupt_compat import request_hard_interrupt
 from dataclasses import dataclass, field
 from tools import file_state
@@ -94,6 +95,31 @@ def _signal_child_stop(child: Any, *reason: str) -> None:
     with _quiet(None):
         if child is not None and not request_hard_interrupt(child, *reason) and hasattr(child, "_interrupt_requested"):
             child._interrupt_requested = True
+
+def _team_authz_gate_child_run() -> Optional[str]:
+    """Re-resolve the ambient requester before a child runs (HTS-04).
+
+    Returns None when the child may run, else the deny reason (already
+    audited). Ungoverned sessions always proceed. A governed child whose
+    requester is unknown, revoked or missing is dropped before any backend
+    access; per-call authorization re-checks during the run.
+    """
+    if not team_authz.is_governed():
+        return None
+    principal = team_authz.resolve_principal()
+    if principal.denied:
+        reason = principal.deny_reason or "unknown-identity"
+        team_authz.audit({
+            "event": "delegate-drop",
+            "policyVersion": principal.policy_version,
+            "memberKey": principal.member_key,
+            "discordUserId": principal.discord_user_id,
+            "tool": "delegate_task",
+            "decision": "denied",
+            "reason": reason,
+        })
+        return reason
+    return None
 
 # ── 0-API-call timeout diagnostic ────────────────────────────────────────────
 
@@ -576,6 +602,11 @@ def _build_child_goal_message(goal: str, images: List[str], child) -> Any:
     hint lines for ``vision_analyze``. Any failure degrades to the text-only goal so image plumbing never breaks a
     spawn — logged at warning since the caller asked for the images.
     """
+    from agent.team_authz_perimeter import media_payload_denial
+    denied = media_payload_denial({"images": images})
+    if denied:
+        # Outside the fallback: a denied path must never become a text hint.
+        raise PermissionError(denied)
     try:
         # data: URLs ride as image parts only — their base64 never goes into the text hint or a text-mode goal.
         data_urls = [s for s in images if s.startswith("data:image/")]
@@ -715,6 +746,14 @@ class _ChildRun:
         from tools.delegate_tool import (_get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb)
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
+        denied = _team_authz_gate_child_run()
+        if denied is not None:
+            logger.warning("Subagent %d dropped by team authorization: %s", task_index, denied)
+            return None, _fabricated_entry(
+                task_index, "error",
+                f"Subagent dropped by team authorization ({denied})",
+                child, self.elapsed(),
+            ), False
         child_timeout = _get_child_timeout()
         executor = DaemonThreadPoolExecutor(
             max_workers=1, initializer=_set_subagent_approval_cb, initargs=(_get_subagent_approval_callback(),),

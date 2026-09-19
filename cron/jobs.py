@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from agent import team_authz
 from hermes_constants import get_hermes_home
 from cron.env_settings import cron_env_setting
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
@@ -403,7 +404,10 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 
 # Fields that must never change after creation: ``id`` is a path component under OUTPUT_DIR, so an
 # update could leak ``../escape``/absolute/nested values into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+# Origin stamps (HTS-04) are creation provenance: updates can neither launder a
+# governed job to an ungoverned origin nor forge another member's identity.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "requester_ref", "requester_governed",
+                                   "requester_digest"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1875,10 +1879,29 @@ def create_job(
     ):
         if value is not None:
             job[key] = value
+    # Origin stamp for fire-time re-resolution (HTS-04): identity fields only,
+    # never grants. Persisted only for governed origins; owner-local jobs keep
+    # byte-identical records and fire exactly as base.
+    job.update(_capture_job_requester_stamp())
 
     with _jobs_lock():
         save_jobs(load_jobs() + [job])
     return job
+
+
+def _capture_job_requester_stamp() -> Dict[str, Any]:
+    """Identity-only origin stamp for fire-time re-resolution (HTS-04)."""
+    try:
+        if not team_authz.is_governed():
+            return {}
+        return {
+            "requester_ref": team_authz.requester_ref(),
+            "requester_governed": True,
+            "requester_digest": team_authz.grant_digest(),
+        }
+    except Exception:
+        return {"requester_ref": {}, "requester_governed": True,
+                "requester_digest": None}
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:

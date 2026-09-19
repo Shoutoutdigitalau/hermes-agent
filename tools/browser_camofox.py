@@ -397,15 +397,28 @@ def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[Dict[str, A
 
 def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
     """Navigate to a URL via Camofox."""
+    from agent.team_authz_perimeter import browser_url_denial, member_browser_restricted
     try:
+        denied = browser_url_denial(url)
+        if denied:
+            return tool_error(denied, success=False)
         browser_url, rewrite_info = _rewrite_loopback_url_for_camofox(url)
+        denied = browser_url_denial(browser_url)
+        if denied:
+            return tool_error(denied, success=False)
         session, data = _navigate_tab(task_id, browser_url)
+        denied = browser_url_denial(data.get("url", browser_url))
+        if denied:
+            return tool_error(denied, success=False)
+        blocked = _camofox_private_page_block(session, task_id, "read navigation result") if member_browser_restricted() else None
+        if blocked:
+            return blocked
         result = {"success": True, "url": data.get("url", browser_url), "title": data.get("title", "")}
         if rewrite_info:
             result["requested_url"], result["url_rewrite"] = url, rewrite_info
             result["warning"] = ("Rewrote loopback URL for Docker-hosted Camofox: "
                                  f"{rewrite_info['from']} -> {rewrite_info['to']}")
-        vnc = get_vnc_url()
+        vnc = None if member_browser_restricted() else get_vnc_url()
         if vnc:
             result["vnc_url"] = vnc
             result["vnc_hint"] = ("Browser is visible via VNC. "
@@ -460,7 +473,13 @@ def _with_tab(task_id: Optional[str], guard_action: Optional[str], body: Callabl
         session, blocked = _require_tab(task_id, guard_action)
         if blocked:
             return blocked
-        return body(session)
+        result = body(session)
+        from agent.team_authz_perimeter import member_browser_restricted
+        if member_browser_restricted():
+            blocked = _camofox_private_page_block(session, task_id, "return page result")
+            if blocked:
+                return blocked
+        return result
     except Exception as e:
         return tool_error(str(e), success=False)
 

@@ -373,6 +373,31 @@ def _canonical_tool_name(function_name: str) -> str:
     return _lta.get(function_name, function_name)
 
 
+def _team_authz_scope_block(function_name: str, function_args: dict) -> Optional[str]:
+    """Team-authz pre-dispatch verdict for both executors (None => proceed).
+
+    Runs on the unwrapped call before inline/delegate/context-engine/memory or
+    registry branches execute. model_tools is already imported by the caller
+    path, so no import fallback is needed; team_authz_denied is total.
+    """
+    from model_tools import team_authz_denied, team_authz_deny_text
+    denied = team_authz_denied(function_name, function_args)
+    return None if denied is None else team_authz_deny_text(denied)
+
+
+def _team_authz_guarded_execute(function_name: str, execute: Callable[[dict], Any]) -> Callable[[dict], Any]:
+    """Recheck final (middleware-transformed) args at actual execution."""
+    from model_tools import team_authz_denied, team_authz_deny_result
+
+    def _guarded(next_args: dict) -> Any:
+        denied = team_authz_denied(function_name, next_args if isinstance(next_args, dict) else {})
+        if denied is not None:
+            return team_authz_deny_result(denied)
+        return execute(next_args)
+
+    return _guarded
+
+
 def _unwrap_tool_search_call(
     agent, function_name: str, function_args: dict, *, flatten_probe: bool = False
 ) -> tuple[str, dict, Optional[str]]:
@@ -440,6 +465,8 @@ def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _Parse
     scope_block = None
     if parse_error is None:
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
+    if parse_error is None and scope_block is None:
+        scope_block = _team_authz_scope_block(name, args)
     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
 
 
@@ -1698,6 +1725,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         tool_start_time = time.time()
         dispatch = _resolve_sequential_dispatch(agent, ref, messages)
+        dispatch.execute = _team_authz_guarded_execute(ref.name, dispatch.execute)
         managed, tool_duration = _run_sequential_call(
             agent, dispatch, ref,
             scope_block=pc.scope_block,

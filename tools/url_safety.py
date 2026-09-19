@@ -252,11 +252,23 @@ def _resolved_ip_block_reason(ip: _IPAddress, allow_private: bool) -> Optional[s
     return None
 
 
-def is_safe_url(url: str) -> bool:
+def _member_forces_public_only() -> bool:
+    """Governed non-owners never inherit the owner's private-URL opt-out."""
+    from agent.team_authz_perimeter import member_browser_restricted
+    return member_browser_restricted()
+
+
+def is_safe_url(url: str, *, public_only: bool = False) -> bool:
     """True if the URL target is not a private/internal address. Resolves the hostname and checks
     every answer; fails closed on DNS errors and unexpected exceptions. ``allow_private_urls``
-    skips private-IP blocking, but cloud metadata endpoints remain blocked regardless."""
+    skips private-IP blocking, but cloud metadata endpoints remain blocked regardless.
+    ``public_only`` overrides private-host exceptions and proxy DNS fail-open for
+    governed browser destinations; it does not pin the browser's TCP connection.
+    Governed non-owner requests always run as ``public_only`` so a local browser or
+    global private-URL toggle cannot grant a member host/LAN access."""
     try:
+        if not public_only and _member_forces_public_only():
+            public_only = True
         parsed = urlparse(url)
         hostname = _normalize_hostname(parsed.hostname)
         scheme = (parsed.scheme or "").strip().lower()
@@ -272,7 +284,7 @@ def is_safe_url(url: str) -> bool:
             return False
         allow_all_private = _global_allow_private_urls()
         allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
-        allow_private = allow_all_private or allow_private_ip
+        allow_private = not public_only and (allow_all_private or allow_private_ip)
         try:
             addr_info = _getaddrinfo(hostname)
         except socket.gaierror:
@@ -280,12 +292,14 @@ def is_safe_url(url: str) -> bool:
             # configured, delegate resolution to it (metadata hostnames were already
             # rejected above). Literal IPs need no DNS, so a failure on one is not a
             # proxy symptom — keep them fail-closed.
-            if _parse_ip(hostname) is None and _proxy_is_configured():
+            if not public_only and _parse_ip(hostname) is None and _proxy_is_configured():
                 logger.debug(
                     "DNS resolution failed for %s — proxy configured, allowing through for proxy-side resolution",
                     hostname)
                 return True
             logger.warning("Blocked request — DNS resolution failed for: %s", hostname)
+            return False
+        if public_only and not addr_info:
             return False
         for raw, ip_str, ip in _iter_resolved_ips(addr_info):
             if ip is None:
@@ -325,6 +339,8 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
     if hostname in _BLOCKED_HOSTNAMES:
         raise SSRFConnectionBlocked(f"Blocked request to internal hostname: {hostname}")
     allow_private = _global_allow_private_urls() or _allows_private_ip_resolution(hostname, scheme)
+    if _member_forces_public_only():
+        allow_private = False
     try:
         addr_info = _getaddrinfo(hostname, port)
     except socket.gaierror as exc:

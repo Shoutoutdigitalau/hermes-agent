@@ -9,9 +9,31 @@ from tools.connectors.gateway.merge import assemble_results, fill_remote_failure
 
 
 def dispatch_connector_call(name, arguments, tool_call_id):
+    from model_tools import team_authz_denied, team_authz_deny_text
     from tools.connectors.gateway.bridge import run_remote
 
+    # Final protected-owner recheck at the real connector boundary (D1: owner
+    # bit from verified provenance only; D3: approval audit precedes dispatch).
+    # Batch entries re-enter handle_function_call per item; this covers direct
+    # remote dispatch and any post-guard argument transformation. An unmapped
+    # connector is ordinary team work (T1): no target-inventory denial here.
+    denied = team_authz_denied(name, arguments if isinstance(arguments, dict) else {})
+    if denied is not None:
+        return json.dumps({"error": team_authz_deny_text(denied)}, ensure_ascii=False)
+
     partition = partition_calls([{"name": name, "arguments": arguments}])
+    if not partition.remote:
+        # Malformed connector tool name (base partitioning error): blocked
+        # work, never retried through browser or login tools.
+        detail = ""
+        if partition.errors:
+            first = partition.errors[0]
+            detail = str((first.get("error") or {}).get("message") or first.get("error") or "")
+        return json.dumps({"error": f"Connector call blocked: malformed connector target {name!r}."
+                                    + (f" {detail}" if detail else "")}, ensure_ascii=False)
+    denied = team_authz_denied(name, arguments, reserve=True)
+    if denied is not None:
+        return json.dumps({"error": team_authz_deny_text(denied)}, ensure_ascii=False)
     entries = run_remote(partition.remote, tool_call_id, availability=None, client_factory=None)
     entry = entries[0]
     return json.dumps({key: value for key, value in entry.items() if key in {"response", "error"}},

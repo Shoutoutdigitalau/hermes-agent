@@ -972,6 +972,9 @@ class TurnRunner:
     def _skip_context_files(self, platform_key) -> bool:
         """gateway.platforms.<plat>.skip_context_files: messaging platforms may opt out of
         filesystem-heavy context-file discovery (SOUL.md, AGENTS.md, .cursorrules)."""
+        # HTS-02: governed non-owner agents are built without the owner's context files.
+        if self._runner._team_authz_governed_non_owner():
+            return True
         platforms_cfg = (self._ctx.user_config.get("gateway") or {}).get("platforms") or {}
         # ``hermes gateway setup`` writes ``gateway.platforms`` as a LIST of enabled platform names,
         # not a dict; treat any non-dict shape as "no per-platform overrides" rather than crashing.
@@ -1099,7 +1102,8 @@ class TurnRunner:
             fallback_model=self._runner._refresh_fallback_model(),
             skip_context_files=skip_context_files,
             # Keep the persona even with minimal context: soul identity is one small file.
-            load_soul_identity=True,
+            # HTS-02: but never for a governed non-owner — SOUL.md is owner context.
+            load_soul_identity=not runner._team_authz_governed_non_owner(),
         )
 
     def _resolve_turn_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr):
@@ -1107,6 +1111,7 @@ class TurnRunner:
         hits) or build a fresh one. Returns (agent, reused_cached_agent)."""
         ctx = self._ctx
         runner = self._runner
+        from agent.team_authz import grant_digest as _team_grant_digest
         skip_context_files = self._skip_context_files(platform_key)
         sig = runner._agent_config_signature(
             turn_route["model"], turn_route["runtime"], ctx.enabled_toolsets, combined_ephemeral,
@@ -1114,6 +1119,10 @@ class TurnRunner:
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,
+            # HTS-02: the bound requester's effective grant; a revoked or changed
+            # grant rebuilds instead of reusing the cached agent. Ungoverned turns
+            # share one stable digest (no behaviour change).
+            grant_digest=_team_grant_digest(),
         )
         cache_lock = getattr(runner, "_agent_cache_lock", None)
         cache = getattr(runner, "_agent_cache", None)

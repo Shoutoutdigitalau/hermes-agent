@@ -42,6 +42,7 @@ from hermes_cli.config import (
     load_config, load_config_readonly, resolve_cron_model_drift_defaults)
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
+from agent import team_authz
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)
@@ -1078,15 +1079,20 @@ def drain_delivery_queue(adapters, loop) -> int:
     # open/create entirely until a worker has actually queued something.
     if not _path().exists():
         return 0
-    return drain(
-        lambda queued_job, queued_content, queued_for_failure: _deliver_result(
+
+    def _gated_send(queued_job, queued_content, queued_for_failure):
+        denied = _gate_governed_delivery(queued_job, for_failure=queued_for_failure)
+        if denied is not None:
+            return f"Delivery blocked by team authorization ({denied})"
+        return _deliver_result(
             queued_job,
             queued_content,
             adapters=adapters,
             loop=loop,
             for_failure=queued_for_failure,
         )
-    )
+
+    return drain(_gated_send)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -1922,12 +1928,147 @@ def _run_doc_header(job: dict, title: str, job_id: str, prompt: str) -> str:
 _RunResult = tuple[bool, str, str, Optional[str]]
 
 
+def _requester_ctx_from_job_ref(ref: Any) -> Optional[team_authz.RequesterContext]:
+    """Rebuild an explicit context from a job's persisted ref (HTS-04)."""
+    if not isinstance(ref, dict) or not ref:
+        return None
+    try:
+        return team_authz.RequesterContext(
+            platform=str(ref.get("platform") or ""),
+            user_id=ref.get("user_id"),
+            scope_id=ref.get("scope_id"),
+            chat_id=ref.get("chat_id"),
+            chat_type=str(ref.get("chat_type") or "dm"),
+            thread_id=ref.get("thread_id"),
+            session_key=ref.get("session_key"),
+        )
+    except Exception:
+        return None
+
+
+def _gate_job_requester(job: dict, job_id: str, job_name: str) -> Optional[_RunResult]:
+    """Fire-time re-resolution of the job's persisted requester (HTS-04).
+
+    Returns a blocked early-result when a governed-origin job's requester is
+    unknown, revoked, stale or missing — audited, before any script or agent
+    runs. Unmarked (pre-feature, owner-local) jobs proceed untouched.
+    """
+    if not job.get("requester_governed"):
+        return None
+    ctx = _requester_ctx_from_job_ref(job.get("requester_ref"))
+    if ctx is None:
+        reason = team_authz.DENY_NO_REQUESTER_CONTEXT
+        team_authz.audit({"event": "cron-drop", "tool": "cronjob",
+                          "decision": "denied", "reason": reason})
+        return _blocked_requester_result(job_id, job_name, reason)
+    principal = team_authz.resolve_principal(ctx)
+    if principal.denied:
+        reason = principal.deny_reason or "unknown-identity"
+        team_authz.audit({"event": "cron-drop", "tool": "cronjob",
+                          "policyVersion": principal.policy_version,
+                          "memberKey": principal.member_key,
+                          "discordUserId": principal.discord_user_id,
+                          "scope": ctx.scope_id, "decision": "denied",
+                          "reason": reason})
+        return _blocked_requester_result(job_id, job_name, reason)
+    digest = job.get("requester_digest")
+    if digest is not None and team_authz.grant_digest(ctx) != digest:
+        team_authz.audit({"event": "cron-drop", "tool": "cronjob",
+                          "policyVersion": principal.policy_version,
+                          "memberKey": principal.member_key,
+                          "discordUserId": principal.discord_user_id,
+                          "scope": ctx.scope_id, "decision": "denied",
+                          "reason": "requester-stale"})
+        return _blocked_requester_result(job_id, job_name, "requester-stale")
+    return None
+
+
+def _blocked_requester_result(job_id: str, job_name: str, reason: str) -> _RunResult:
+    """Blocked-fire result shape for a dropped governed job (cf. injection block)."""
+    logger.warning("Job '%s' (ID: %s): dropped by team authorization — %s",
+                   job_name, job_id, reason)
+    blocked_doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"**Status:** DROPPED\n\n"
+        "The job's persisted requester no longer resolves and the agent was "
+        "NOT run.\n\n"
+        f"**Reason:** {reason}\n"
+    )
+    return (False, blocked_doc, "", f"Dropped by team authorization ({reason})")
+
+
+def _gate_governed_delivery(job: dict, *, for_failure: bool) -> Optional[str]:
+    """Fail-closed delivery check for governed-origin jobs (HTS-04).
+
+    Returns None to proceed, else the deny reason (audited). The run scope has
+    already exited when delivery runs, so this re-resolves the persisted
+    requester explicitly and holds every resolved external target to the core
+    origin-only floor: owner and local-only deliveries proceed; a denied or
+    stale requester, and any cross-origin, missing or ambiguous target, denies
+    before any adapter call. Live, crash-failure and queued/replayed
+    deliveries gate identically.
+    """
+    if not job.get("requester_governed"):
+        return None
+
+    def _deny(reason: str, principal=None, ctx=None, destination=None) -> str:
+        team_authz.audit({
+            "event": "cron-delivery-drop",
+            "tool": "cronjob",
+            "policyVersion": principal.policy_version if principal is not None else "",
+            "memberKey": principal.member_key if principal is not None else "",
+            "discordUserId": (principal.discord_user_id if principal is not None
+                              else (ctx.user_id if ctx is not None else "")),
+            "scope": ctx.scope_id if ctx is not None else None,
+            "decision": "denied",
+            "reason": reason,
+            "destination": destination,
+        })
+        return reason
+
+    ctx = _requester_ctx_from_job_ref(job.get("requester_ref"))
+    if ctx is None:
+        return _deny(team_authz.DENY_NO_REQUESTER_CONTEXT)
+    principal = team_authz.resolve_principal(ctx)
+    if principal.denied:
+        return _deny(principal.deny_reason or "unknown-identity",
+                      principal=principal, ctx=ctx)
+    if principal.is_owner:
+        return None
+    digest = job.get("requester_digest")
+    if digest is not None and team_authz.grant_digest(ctx) != digest:
+        return _deny("requester-stale", principal=principal, ctx=ctx)
+    try:
+        targets = _resolve_delivery_targets(job, for_failure=for_failure)
+    except Exception:
+        return _deny("delivery-target-unresolved", principal=principal, ctx=ctx)
+    if not targets:
+        return None  # local-only: _deliver_result makes no adapter call
+    for target in targets:
+        target = target or {}
+        chat_id = target.get("chat_id")
+        if str(target.get("platform") or "").lower() != (ctx.platform or "").lower():
+            return _deny("destination-outside-origin", principal=principal, ctx=ctx,
+                         destination=chat_id)
+        decision = team_authz.may_send_to(
+            {"chatId": chat_id, "threadId": target.get("thread_id")}, ctx)
+        if not decision.allowed:
+            return _deny(decision.reason or "destination-outside-origin",
+                         principal=principal, ctx=ctx, destination=chat_id)
+    return None
+
+
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
     injection block, empty prompt); otherwise ``prompt`` is set."""
+    authz_early = _gate_job_requester(job, job_id, job_name)
+    if authz_early is not None:
+        return authz_early, None
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):
@@ -2058,6 +2199,11 @@ class _CronRunScope:
         self._cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
         self._cron_session_token = None
         self._non_dispatcher_token = None
+        # Governed-origin jobs run under their persisted requester (HTS-04):
+        # re-resolved by the fire gate, bound here for the run so per-call
+        # authorization sees the originating member. Identity only.
+        self._requester_ref = job.get("requester_ref") if job.get("requester_governed") else None
+        self._requester_token = None
 
     def enter(self) -> None:
         # Scope cron approval policy; exit() RESETS via token (pinning "" would suppress the legacy
@@ -2068,6 +2214,8 @@ class _CronRunScope:
         # ContextVar, NOT an os.environ clear (env is shared with the worker heartbeat and
         # concurrent jobs); copy_context() carries it into the agent thread.
         self._non_dispatcher_token = enter_non_dispatcher_owned_context()
+        if self._requester_ref:
+            self._requester_token = team_authz.bind_requester(self._requester_ref)
 
     def exit(self) -> None:
         from gateway.session_context import clear_session_vars
@@ -2077,6 +2225,9 @@ class _CronRunScope:
         clear_session_vars(self._ctx_tokens)  # also clears _SESSION_CWD
         if self._cron_session_token is not None:
             self._cron_session_var.reset(self._cron_session_token)
+        if self._requester_token is not None:
+            team_authz.reset_requester(self._requester_token)
+            self._requester_token = None
         if self._non_dispatcher_token is not None:
             exit_non_dispatcher_owned_context(self._non_dispatcher_token)
         for name in _CRON_DELIVERY_VARS:
@@ -2696,6 +2847,12 @@ def _save_compose_deliver(
         _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)) == "origin"
         and not _resolve_delivery_targets(job, for_failure=not d.success)
     )
+    delivery_denied = _gate_governed_delivery(job, for_failure=not d.success)
+    if delivery_denied is not None:
+        d.delivery_attempted = True
+        d.delivery_error = f"Delivery blocked by team authorization ({delivery_denied})"
+        logger.warning("Job '%s': %s", job["id"], d.delivery_error)
+        return
     try:
         with fence.side_effect_fence() as owns_delivery:
             if not owns_delivery:
@@ -2790,6 +2947,11 @@ def _deliver_crash_failure(
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
+    denied = _gate_governed_delivery(job, for_failure=True)
+    if denied is not None:
+        delivery_error = f"Delivery blocked by team authorization ({denied})"
+        logger.warning("Job '%s': %s", job.get("id"), delivery_error)
+        return delivery_error, "failed"
     delivery_error = None
     try:
         delivery_error = _deliver_result(

@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from toolsets import TOOLSETS
+from agent import team_authz
+from toolsets import TOOLSETS, resolve_toolset
 from tools.delegate_tool_config import _get_inherit_mcp_toolsets
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
@@ -111,4 +112,43 @@ def _resolve_child_toolsets(
     child_disabled_toolsets = list(
         dict.fromkeys(inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"])
     )
-    return child_toolsets, child_disabled_toolsets
+    return _apply_requester_toolset_filter(child_toolsets, child_disabled_toolsets)
+
+
+def _apply_requester_toolset_filter(
+    child_toolsets: List[str], child_disabled_toolsets: List[str]
+) -> tuple[List[str], List[str]]:
+    """Intersect child toolsets with the requester's discovery filter (HTS-04).
+
+    Governed sessions only: drop child toolsets that contribute no tool the
+    requester's role could use (inherited MCP toolsets included — they survive
+    only when the role allows their tools), and deny-list toolsets composed
+    entirely of tools the requester filter excludes, so mixed bundles lose
+    exactly the denied tools where expressible (same derivation as
+    ``_blocked_toolsets_for_role``). The filter re-resolves the live register;
+    nothing here caches a grant. Execution re-authorizes per call. Ungoverned
+    sessions return the inputs unchanged.
+    """
+    if not team_authz.is_governed():
+        return child_toolsets, child_disabled_toolsets
+    per_toolset: dict = {}
+    universe: set = set()
+    for name in child_toolsets:
+        try:
+            tools = set(resolve_toolset(str(name)))
+        except Exception:
+            tools = set()
+        per_toolset[str(name)] = tools
+        universe |= tools
+    allowed = team_authz.filter_tool_names(universe)
+    kept = [t for t in child_toolsets if per_toolset[str(t)] & allowed]
+    disallowed = universe - allowed
+    disabled = list(child_disabled_toolsets)
+    if disallowed:
+        deny = sorted(
+            name for name, defn in TOOLSETS.items()
+            if defn.get("tools") and set(defn.get("tools", ())).issubset(disallowed)
+            and name not in disabled
+        )
+        disabled.extend(deny)
+    return kept, disabled
