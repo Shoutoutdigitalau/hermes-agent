@@ -335,7 +335,7 @@ class _NoneAdapter:
 class TestToolsetTrap:
     def _trap_runner(self, adapter):
         runner = _runner()
-        runner._adapter_for_source = lambda source: adapter
+        runner._delivery_adapter_for = lambda source: adapter
         return runner
 
     def test_override_exception_denies_governed(self, home):
@@ -578,7 +578,7 @@ class TestBackgroundGate:
         runner = _runner()
         adapter = AsyncMock()
         adapter.send = AsyncMock()
-        runner._adapter_for_source = lambda source: adapter
+        runner._delivery_adapter_for = lambda source: adapter
         runner._thread_metadata_for_source = lambda *a, **k: {}
         return runner, adapter
 
