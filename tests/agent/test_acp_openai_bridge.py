@@ -213,3 +213,48 @@ def test_copilot_prompt_omits_the_tool_section_when_there_are_no_tools():
     prompt = _format_messages_as_prompt([{"role": "user", "content": "hi"}])
     assert "Available tools" not in prompt
     assert "Tool choice hint" not in prompt
+
+
+def test_prompt_preserves_tool_call_history_and_result_correlation():
+    from copy import deepcopy
+    from agent.copilot_acp_client import _format_messages_as_prompt
+
+    calls = [
+        {"id": "first_call", "type": "function", "function": {
+            "name": "terminal", "arguments": json.dumps({"command": "echo first"})}},
+        {"id": "second_call", "type": "function", "function": {
+            "name": "read_file", "arguments": json.dumps({"path": "résumé.txt"})}},
+    ]
+    messages = [
+        {"role": "user", "content": "Run and read once, then report."},
+        {"role": "assistant", "content": None, "tool_calls": calls},
+        {"role": "tool", "tool_call_id": "first_call", "name": "terminal",
+         "content": '{"output":"first","exit_code":0}'},
+        {"role": "tool", "tool_call_id": "second_call", "name": "read_file",
+         "content": '{"error":"File not found"}'},
+    ]
+    original = deepcopy(messages)
+    prompt = _format_messages_as_prompt(messages)
+    for call in calls:
+        assert json.dumps(call, ensure_ascii=False) in prompt
+        assert json.dumps({"tool_call_id": call["id"], "name": call["function"]["name"]}) in prompt
+    assert prompt.index("Assistant:") < prompt.index('"tool_call_id": "first_call"')
+    assert prompt.index('"tool_call_id": "first_call"') < prompt.index('"output":"first"')
+    assert prompt.index('"tool_call_id": "second_call"') < prompt.index('"error":"File not found"')
+    assert messages == original
+
+
+def test_prompt_keeps_assistant_text_and_an_empty_tool_result():
+    from agent.copilot_acp_client import _format_messages_as_prompt
+
+    call = {"id": "empty_call", "type": "function", "function": {
+        "name": "terminal", "arguments": "{}"}}
+    prompt = _format_messages_as_prompt([
+        {"role": "assistant", "content": [{"type": "text", "text": "Checking now."}],
+         "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "empty_call", "content": ""},
+    ])
+    assert "Checking now." in prompt
+    assert json.dumps(call) in prompt
+    assert '"tool_call_id": "empty_call"' in prompt
+    assert prompt.index("Checking now.") < prompt.index('"tool_call_id": "empty_call"')

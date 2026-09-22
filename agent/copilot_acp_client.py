@@ -14,6 +14,7 @@ import queue
 import re
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -103,7 +104,7 @@ def _acp_supported(command: str, args: list[str]) -> bool | None:
 
 
 def _resolve_home_dir() -> str:
-    """Stable HOME for child ACP processes; /tmp as a last resort so the child never starts HOME-less."""
+    """Stable HOME for child ACP processes; the temp dir as a last resort so the child never starts HOME-less."""
     if home := os.environ.get("HOME", "").strip():
         return home
     if (expanded := os.path.expanduser("~")) and expanded != "~":
@@ -111,9 +112,9 @@ def _resolve_home_dir() -> str:
     try:
         import pwd
 
-        return pwd.getpwuid(os.getuid()).pw_dir.strip() or "/tmp"  # windows-footgun: ok — POSIX fallback inside try/except (pwd import fails on Windows)
+        return pwd.getpwuid(os.getuid()).pw_dir.strip() or tempfile.gettempdir()  # windows-footgun: ok — POSIX fallback inside try/except (pwd import fails on Windows)
     except Exception:
-        return "/tmp"
+        return tempfile.gettempdir()
 
 
 def _build_subprocess_env() -> dict[str, str]:
@@ -196,11 +197,19 @@ def _format_messages_as_prompt(
     transcript: list[str] = []
     for message in (m for m in messages if isinstance(m, dict)):
         role = str(message.get("role") or "unknown").strip().lower()
-        if rendered := _render_message_content(message.get("content")):
+        rendered = _render_message_content(message.get("content"))
+        if role == "assistant" and message.get("tool_calls"):
+            # Each ACP request starts fresh; retain calls as well as their results.
+            rendered += "\nTool calls:\n" + json.dumps(message["tool_calls"], ensure_ascii=False)
+        if role == "tool":
+            metadata = {key: message[key] for key in ("tool_call_id", "name") if message.get(key)}
+            if metadata:
+                rendered = json.dumps(metadata, ensure_ascii=False) + "\n" + rendered
+        if rendered:
             transcript.append(f"{_ROLE_LABELS.get(role, 'Context')}:\n{rendered}")
     if transcript:
         sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
-    sections.append("Continue the conversation from the latest user request.")
+    sections.append("Continue from the end of the transcript, using the tool results already recorded.")
     return "\n\n".join(section.strip() for section in sections if section and section.strip())
 
 
