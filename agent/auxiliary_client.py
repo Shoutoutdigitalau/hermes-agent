@@ -7088,8 +7088,14 @@ async def _aggregate_chat_stream_async(
     acc = _ChatStreamAccumulator(
         model=model, total_ceiling=total_ceiling, host_deadline=_current_aux_stream_deadline())
     try:
-        async for chunk in chunks:
-            acc.feed(chunk)
+        if hasattr(chunks, "__aiter__"):
+            async for chunk in chunks:
+                acc.feed(chunk)
+        else:
+            # A synchronous shim (ACP subprocess) hands back a materialized chunk iterable that
+            # ``_acreate_from_client`` already produced off the loop, not an ``AsyncOpenAI`` stream.
+            for chunk in chunks:
+                acc.feed(chunk)
     finally:
         pending = _close_chunk_stream(chunks, allow_aclose=True)
         if pending is not None:
@@ -7101,7 +7107,7 @@ async def _aggregate_chat_stream_async(
 async def _acreate_with_stream(client: Any, kwargs: Dict[str, Any], task: Optional[str] = None) -> Any:
     """Async create() for stream-only providers: ``stream=True`` + aggregate the async chunks."""
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs)
-    chunks = await client.chat.completions.create(**stream_kwargs)
+    chunks = await _acreate_from_client(client, stream_kwargs)
     if hasattr(chunks, "choices"):  # shims may hand back a complete response despite stream=True
         return chunks
     return await _aggregate_chat_stream_async(chunks, model=model, total_ceiling=total_ceiling)
@@ -7110,6 +7116,34 @@ async def _acreate_with_stream(client: Any, kwargs: Dict[str, Any], task: Option
 def _async_client_streams_internally(client: Any) -> bool:
     """Async twin of :func:`_client_streams_internally` (the async adapters are separate classes)."""
     return isinstance(client, (AsyncCodexAuxiliaryClient, AsyncAnthropicAuxiliaryClient, AsyncBedrockAuxiliaryClient))
+
+
+def _async_shim_create_runs_in_thread(client: Any) -> bool:
+    """Whether ``client`` is a synchronous shim the async seam must run in a worker thread.
+
+    A client declaring ``HERMES_SKIP_ASYNC_WRAP`` skipped ``_AsyncAuxiliaryClientBase``, so the
+    async seam awaits its ``create`` directly. When that ``create`` is a plain function (the ACP
+    subprocess shims), calling it inline blocks the event loop for the whole session."""
+    if not _client_declares(client, "HERMES_SKIP_ASYNC_WRAP"):
+        return False
+    try:
+        create = client.chat.completions.create
+    except AttributeError:
+        return False
+    return not inspect.iscoroutinefunction(create)
+
+
+async def _acreate_from_client(client: Any, kwargs: Dict[str, Any]) -> Any:
+    """Await one provider ``create``; a synchronous shim runs in a worker thread.
+
+    ``asyncio.to_thread`` is what ``_AsyncCompletionsAdapter`` does for the ordinary sync→async
+    wrapper, so an opted-out shim keeps that wrapper's off-loop contract instead of stalling the
+    loop. An awaitable result (a sync shim delegating to async internals) is still awaited."""
+    if _async_shim_create_runs_in_thread(client):
+        import asyncio  # local import: asyncio stays out of this module's import cost
+        result = await asyncio.to_thread(client.chat.completions.create, **kwargs)
+        return await result if inspect.isawaitable(result) else result
+    return await client.chat.completions.create(**kwargs)
 
 
 async def _acreate_with_progress(
@@ -7121,13 +7155,13 @@ async def _acreate_with_progress(
     _notify_aux_dispatch()
     # Same contract as the sync twin (#114938): dispatch alone is not progress.
     if (not _aux_progress_active() and not force_stream) or _async_client_streams_internally(client):
-        response = await client.chat.completions.create(**kwargs)
+        response = await _acreate_from_client(client, kwargs)
         if not _async_client_streams_internally(client):
             _notify_aux_provider_response()
         return response
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs)
     try:
-        chunks = await client.chat.completions.create(**stream_kwargs)
+        chunks = await _acreate_from_client(client, stream_kwargs)
     except Exception as exc:
         # Only a rejected stream NEGOTIATION falls back to a plain call (mirrors the sync wrapper); a
         # failure mid-consumption below reaches the classified recovery ladder instead of silently
@@ -7138,7 +7172,7 @@ async def _acreate_with_progress(
         logger.debug("Auxiliary %s: streamed async request failed (%s); retrying non-streaming",
                      task or "call", exc)
         _notify_aux_dispatch()
-        response = await client.chat.completions.create(**kwargs)
+        response = await _acreate_from_client(client, kwargs)
         _notify_aux_provider_response()
         return response
     if hasattr(chunks, "choices"):  # shims may hand back a complete response despite stream=True
